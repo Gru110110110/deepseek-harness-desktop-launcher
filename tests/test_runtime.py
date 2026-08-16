@@ -400,7 +400,12 @@ class RuntimeStateTest(unittest.TestCase):
                 ),
             ):
                 with self.assertRaises(LocalizedError):
-                    runtime.deploy_runtime(paths, lambda _step: None, force=True)
+                    runtime.deploy_runtime(
+                        paths,
+                        lambda _step: None,
+                        force=True,
+                        target_version=TEST_HARNESS_VERSION,
+                    )
             self.assertTrue((paths.node_dir / "old.txt").is_file())
             self.assertFalse((paths.node_dir / "new.txt").exists())
 
@@ -543,6 +548,19 @@ class RuntimeStateTest(unittest.TestCase):
                     with self.assertRaises(LocalizedError):
                         with runtime._DeploymentLock(paths.deployment_lock, runtime.DeploymentController()):
                             self.fail("the second writer must not acquire the active lock")
+
+    def test_windows_process_probe_does_not_send_a_console_event(self) -> None:
+        with (
+            patch.object(runtime.os, "name", "nt"),
+            patch.object(runtime, "_windows_process_exists", return_value=True) as query,
+            patch.object(runtime.os, "kill", side_effect=AssertionError("must not signal")),
+        ):
+            self.assertTrue(runtime._process_exists(1234))
+        query.assert_called_once_with(1234)
+
+    @unittest.skipUnless(os.name == "nt", "requires the Windows process API")
+    def test_windows_process_probe_finds_the_current_process(self) -> None:
+        self.assertTrue(runtime._process_exists(os.getpid()))
 
     def test_subprocess_environment_drops_ambient_secrets_but_keeps_proxy_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

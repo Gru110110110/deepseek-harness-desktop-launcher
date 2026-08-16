@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -23,7 +24,7 @@ from cc_switch_import import (
 def _create_database(home: Path, rows: list[dict[str, object]]) -> Path:
     home.mkdir(parents=True)
     database = home / "cc-switch.db"
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute(
             """CREATE TABLE providers (
                 id TEXT NOT NULL,
@@ -360,7 +361,9 @@ class CcSwitchImportTest(unittest.TestCase):
             )
             import_cc_switch_configuration(cc_switch_home, dsh_home, marker)
             expected = (dsh_home / ".credentials.yaml").read_bytes()
-            with sqlite3.connect(cc_switch_home / "cc-switch.db") as connection:
+            with closing(
+                sqlite3.connect(cc_switch_home / "cc-switch.db")
+            ) as connection, connection:
                 settings = {
                     "env": {
                         "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",

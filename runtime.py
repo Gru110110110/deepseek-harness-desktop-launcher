@@ -831,9 +831,47 @@ def is_runtime_ready(paths: ApplicationPaths) -> bool:
     return _runtime_is_valid(paths, None)
 
 
+def _windows_process_exists(pid: int) -> bool:
+    """Query a Windows process handle without sending a console event."""
+    import ctypes
+    from ctypes import wintypes
+
+    synchronize = 0x00100000
+    wait_object_0 = 0x00000000
+    wait_timeout = 0x00000102
+    error_access_denied = 5
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    open_process.restype = wintypes.HANDLE
+    wait_for_single_object = kernel32.WaitForSingleObject
+    wait_for_single_object.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    wait_for_single_object.restype = wintypes.DWORD
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    handle = open_process(synchronize, False, pid)
+    if not handle:
+        # Access denied still proves that the PID names a protected process.
+        return ctypes.get_last_error() == error_access_denied
+    try:
+        status = wait_for_single_object(handle, 0)
+        if status == wait_timeout:
+            return True
+        if status == wait_object_0:
+            return False
+        return False
+    finally:
+        close_handle(handle)
+
+
 def _process_exists(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return _windows_process_exists(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

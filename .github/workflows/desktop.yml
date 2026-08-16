@@ -33,6 +33,11 @@ jobs:
           architecture: ${{ matrix.arch }}
 
       - name: Test desktop runtime and launcher
+        env:
+          DSH_DESKTOP_HOME: ${{ runner.temp }}/dsh-desktop-tests
+          DSH_HOME: ${{ runner.temp }}/dsh-home-tests
+          DSH_DESKTOP_SOURCE_HOME: ${{ runner.temp }}/dsh-source-home-tests
+          DSH_DESKTOP_CC_SWITCH_HOME: ${{ runner.temp }}/cc-switch-home-tests
         run: python -m unittest discover -s tests -v
 
       - name: Verify runtime sources
@@ -79,6 +84,11 @@ jobs:
           python-version: "3.11"
 
       - name: Test desktop runtime and launcher
+        env:
+          DSH_DESKTOP_HOME: ${{ runner.temp }}/dsh-desktop-tests
+          DSH_HOME: ${{ runner.temp }}/dsh-home-tests
+          DSH_DESKTOP_SOURCE_HOME: ${{ runner.temp }}/dsh-source-home-tests
+          DSH_DESKTOP_CC_SWITCH_HOME: ${{ runner.temp }}/cc-switch-home-tests
         run: python -m unittest discover -s tests -v
 
       - name: Verify runtime sources

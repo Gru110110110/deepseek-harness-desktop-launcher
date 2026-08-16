@@ -17,6 +17,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -232,7 +233,7 @@ def _read_providers(database: Path) -> tuple[list[_Provider], int]:
     if database.is_symlink() or not database.is_file():
         return [], 0
     uri = f"{database.resolve(strict=True).as_uri()}?mode=ro"
-    with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+    with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only = ON")
         columns = {
