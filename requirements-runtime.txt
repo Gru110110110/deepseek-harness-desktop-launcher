@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+pystray==0.19.5
+Pillow==12.3.0
+six==1.17.0
+pyobjc-core==12.2.2; sys_platform == "darwin"
+pyobjc-framework-Cocoa==12.2.2; sys_platform == "darwin"
+pyobjc-framework-Quartz==12.2.1; sys_platform == "darwin"

@@ -1,0 +1,4 @@
+# Git blob hashes from the last review that confirmed both languages agree.
+# Update both documents together, then replace these values with `git hash-object`.
+2026-08-16-desktop-launcher-status-workspace.md: 96903f8a5ef31621d3305b8e9f1daba7b3c4a059
+2026-08-16-desktop-launcher-status-workspace.zh.md: 444ed2a1805239bf46a0b0fa764cfbb445e0264c

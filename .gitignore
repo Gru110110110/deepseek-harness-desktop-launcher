@@ -1,0 +1,9 @@
+# DeepSeek Harness desktop launcher build artifacts
+.DS_Store
+.build-venv/
+dist/
+build/mac/
+build/windows/
+build-work/
+__pycache__/
+*.pyc

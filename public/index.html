@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DSH Launcher — DeepSeek Harness 桌面启动器</title>
+  <meta name="description" content="DSH Launcher 是 DeepSeek Harness 的非官方桌面启动器：双击启动、打开即用，在浏览器里使用官方 Web UI。支持 macOS 与 Windows，中英双语。" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="DSH Launcher — DeepSeek Harness 桌面启动器" />
+  <meta property="og:description" content="双击启动，打开即用。浏览器里，就是官方 Web UI。支持 macOS 与 Windows。" />
+  <meta property="og:image" content="https://raw.githubusercontent.com/Gru110110110/deepseek-harness-desktop-launcher/main/public/screenshots/ScreenShot_zh.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <link rel="icon" type="image/png" href="assets/logo.png" />
+  <link rel="stylesheet" href="style.css" />
+  <noscript>
+    <style>
+      /* JS 不可用时直接显示内容，禁用入场动画的初始隐藏态 */
+      .reveal { opacity: 1 !important; transform: none !important; }
+    </style>
+  </noscript>
+</head>
+<body>
+
+  <!-- 背景装饰 -->
+  <div class="bg-grid" aria-hidden="true"></div>
+  <div class="glow glow-a" aria-hidden="true"></div>
+  <div class="glow glow-b" aria-hidden="true"></div>
+
+  <!-- 导航 -->
+  <header class="nav" id="nav">
+    <div class="nav-inner">
+      <a class="nav-brand" href="#top">
+        <img src="assets/logo.png" alt="DSH Launcher logo" class="nav-logo" />
+        <span class="nav-title">DSH <em>Launcher</em></span>
+      </a>
+      <nav class="nav-links">
+        <a href="#how" data-i18n="nav.how">运行原理</a>
+        <a href="#features" data-i18n="nav.features">特性</a>
+        <a href="#download" data-i18n="nav.download">下载</a>
+        <a href="#faq" data-i18n="nav.faq">FAQ</a>
+      </nav>
+      <div class="nav-actions">
+        <button class="lang-toggle" id="langToggle" type="button" aria-label="Switch language">EN</button>
+        <a class="btn btn-ghost btn-sm" href="https://github.com/Gru110110110/deepseek-harness-desktop-launcher" target="_blank" rel="noopener">
+          <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+          GitHub
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <main id="top">
+
+    <!-- Hero -->
+    <section class="hero">
+      <div class="container">
+        <div class="hero-badges reveal">
+          <span class="badge"><i class="dot"></i><span data-i18n="hero.badge">v0.1.0 早期预览 · MIT 开源</span></span>
+          <span class="badge badge-dim" data-i18n="hero.badge2">非官方启动器 · 不改动官方 Harness</span>
+        </div>
+        <h1 class="hero-title reveal" data-i18n-html="hero.title">
+          双击启动，打开即用。<br /><span class="grad">浏览器里，就是官方 Web UI。</span>
+        </h1>
+        <p class="hero-sub reveal" data-i18n="hero.sub">
+          DSH Launcher 是 DeepSeek Harness 的非官方桌面启动器。它不做二次包装、不改交互逻辑——只负责把官方服务稳稳地跑起来，然后把服务发布的 Web UI 地址交给你，在你喜欢的浏览器里打开。
+        </p>
+        <div class="hero-cta reveal">
+          <a class="btn btn-primary" href="#download">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <span data-i18n="hero.cta1">立即下载</span>
+          </a>
+          <a class="btn btn-ghost" href="https://github.com/Gru110110110/deepseek-harness-desktop-launcher" target="_blank" rel="noopener" data-i18n="hero.cta2">查看 GitHub</a>
+        </div>
+        <p class="hero-note reveal" data-i18n="hero.note">macOS（Apple Silicon / Intel）与 Windows x64 · 界面支持中文与 English</p>
+
+        <!-- 主截图 -->
+        <div class="hero-shot reveal" id="heroShot">
+          <div class="shot-frame">
+            <div class="shot-bar">
+              <span class="shot-dot r"></span><span class="shot-dot y"></span><span class="shot-dot g"></span>
+              <span class="shot-title">DSH Launcher</span>
+            </div>
+            <img id="heroImg" src="screenshots/ScreenShot_zh.png" alt="DSH Launcher 主界面截图" width="1520" height="1024" decoding="async" fetchpriority="high" />
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 定位：薄，是故意的 -->
+    <section class="section thin">
+      <div class="container">
+        <p class="kicker reveal" data-i18n="thin.kicker">设计取向</p>
+        <h2 class="section-title reveal" data-i18n-html="thin.title">薄，是故意的。<span class="grad">启动器只做启动。</span></h2>
+        <p class="section-sub reveal" data-i18n="thin.sub">
+          不内置账号体系，不 fork 官方界面，不捆绑多余运行时。DSH Launcher 是一个「薄壳」：准备好官方依赖、拉起官方服务、把官方地址交出去——你在浏览器里用到的，始终是 DeepSeek Harness 原版 Web UI。
+        </p>
+        <div class="thin-grid">
+          <div class="thin-card reveal">
+            <div class="thin-x" aria-hidden="true">✕</div>
+            <h3 data-i18n="thin.no1t">不重新包装</h3>
+            <p data-i18n="thin.no1d">没有自绘的聊天界面、没有中转层。界面、会话、模型能力全部来自官方 @deepseek-ai/dsh。</p>
+          </div>
+          <div class="thin-card reveal">
+            <div class="thin-x" aria-hidden="true">✕</div>
+            <h3 data-i18n="thin.no2t">不抢占地址</h3>
+            <p data-i18n="thin.no2d">显示和打开的永远是服务自己发布的 dsh web: &lt;URL&gt;；官方默认端口被占用时，用官方 --port 0 自动换空闲端口。</p>
+          </div>
+          <div class="thin-card reveal">
+            <div class="thin-x" aria-hidden="true">✕</div>
+            <h3 data-i18n="thin.no3t">不碰你的数据</h3>
+            <p data-i18n="thin.no3d">数据独立存放在 ~/.dsh-desktop，升级不丢配置与会话；密钥类信息永远不会进入安装目录。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 运行原理 -->
+    <section class="section" id="how">
+      <div class="container">
+        <p class="kicker reveal" data-i18n="how.kicker">运行原理</p>
+        <h2 class="section-title reveal" data-i18n-html="how.title">三步，从安装到<span class="grad">官方工作台</span></h2>
+        <div class="steps">
+          <div class="step reveal">
+            <div class="step-num">01</div>
+            <h3 data-i18n="how.s1t">下载安装</h3>
+            <p data-i18n="how.s1d">一个 DMG 或 EXE，拖进应用程序即完成安装。不需要自己装 Node，不需要敲任何命令。</p>
+          </div>
+          <div class="step-arrow" aria-hidden="true">→</div>
+          <div class="step reveal">
+            <div class="step-num">02</div>
+            <h3 data-i18n="how.s2t">双击启动</h3>
+            <p data-i18n="how.s2d">首次启动自动下载并校验固定版本的 Node 与官方 @deepseek-ai/dsh：SHA-256 校验、staging 安装、原子替换，失败自动回滚。</p>
+          </div>
+          <div class="step-arrow" aria-hidden="true">→</div>
+          <div class="step reveal">
+            <div class="step-num">03</div>
+            <h3 data-i18n="how.s3t">打开 Web UI</h3>
+            <p data-i18n="how.s3d">服务就绪后窗口会显示实际地址与运行时长，点一下「打开 Web UI」，在你选择的浏览器里进入官方界面。</p>
+          </div>
+        </div>
+
+        <div class="terminal reveal">
+          <div class="terminal-bar"><span class="shot-dot r"></span><span class="shot-dot y"></span><span class="shot-dot g"></span><span class="terminal-title" data-i18n="how.term">启动过程 · 启动器日志</span></div>
+          <pre><code><span class="t-dim">$</span> open DSHLauncher.app
+<span class="t-ok">✓</span> <span data-i18n="how.l1">校验版本标记、manifest、Node 与 dsh 入口</span>
+<span class="t-ok">✓</span> <span data-i18n="how.l2">本地服务已启动（官方默认端口）</span>
+<span class="t-ok">✓</span> <span data-i18n="how.l3">检测到官方新版本 → 提示「立即更新」</span>
+<span class="t-ok">✓</span> dsh web: <span class="t-hl">http://127.0.0.1:3080</span>
+<span class="t-dim" data-i18n="how.l4">→ 窗口显示实际地址 + 运行时长 +「打开 Web UI」按钮</span></code></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- 截图展示 -->
+    <section class="section" id="screens">
+      <div class="container">
+        <p class="kicker reveal" data-i18n="shots.kicker">界面</p>
+        <h2 class="section-title reveal" data-i18n-html="shots.title">桌面只管启动，<span class="grad">工作发生在浏览器</span></h2>
+        <div class="shot-gallery">
+          <figure class="reveal">
+            <img src="screenshots/ScreenShot_zh.png" alt="DSH Launcher 中文界面" width="1520" height="1024" loading="lazy" decoding="async" />
+            <figcaption data-i18n="shots.c1">启动器窗口 · 中文界面（可在侧栏随时切换 English）</figcaption>
+          </figure>
+          <figure class="reveal">
+            <img src="screenshots/ScreenShot_ccswitch_config.png" alt="浏览器中的官方 DeepSeek Harness Web UI" width="1790" height="1054" loading="lazy" decoding="async" />
+            <figcaption data-i18n="shots.c2">浏览器里的官方 Web UI · 完整模型与会话能力</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <!-- 特性 -->
+    <section class="section" id="features">
+      <div class="container">
+        <p class="kicker reveal" data-i18n="feat.kicker">特性</p>
+        <h2 class="section-title reveal" data-i18n-html="feat.title">小事做稳，<span class="grad">剩下的交给官方</span></h2>
+        <div class="feat-grid">
+          <div class="feat-card reveal">
+            <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg></div>
+            <h3 data-i18n="feat.f1t">双击即用</h3>
+            <p data-i18n="feat.f1d">运行时（Node 与 dsh）首次启动自动下载安装，之后每次启动先校验再拉起服务，全程无需命令行。</p>
+          </div>
+          <div class="feat-card reveal">
+            <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><circle cx="6.5" cy="6.5" r="0.5"/><circle cx="9.5" cy="6.5" r="0.5"/></svg></div>
+            <h3 data-i18n="feat.f2t">官方 Web UI</h3>
+            <p data-i18n="feat.f2d">地址由服务自己发布，点击即用所选浏览器打开。启动器永不替换为自建地址或端口。</p>
+          </div>
+          <div class="feat-card reveal">
+            <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="M5 8l7-5 7 5"/><path d="M5 16l7 5 7-5"/></svg></div>
+            <h3 data-i18n="feat.f3t">多浏览器选择</h3>
+            <p data-i18n="feat.f3d">自动检测已安装的浏览器：只有一款就直接打开，多款则下拉选择；找不到时用系统默认浏览器兜底。</p>
+          </div>
+          <div class="feat-card reveal">
+            <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/></svg></div>
+            <h3 data-i18n="feat.f4t">托盘常驻</h3>
+            <p data-i18n="feat.f4d">关闭窗口只是隐藏到系统托盘，本地服务继续运行；托盘里的「退出」才会完整停止服务进程树。</p>
+          </div>
+          <div class="feat-card reveal">
+            <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6z"/><polyline points="8.5 12 11 14.5 15.5 9.5"/></svg></div>
+            <h3 data-i18n="feat.f5t">校验与回滚</h3>
+            <p data-i18n="feat.f5d">Node 归档必须匹配固定的 SHA-256；安装走 staging + 原子替换，失败保留旧版本，可回滚目录始终在手。</p>
+          </div>
+          <div class="feat-card reveal">
+            <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c2.5 2.6 3.9 5.7 3.9 9s-1.4 6.4-3.9 9c-2.5-2.6-3.9-5.7-3.9-9s1.4-6.4 3.9-9z"/></svg></div>
+            <h3 data-i18n="feat.f6t">中英双语</h3>
+            <p data-i18n="feat.f6d">首次按系统语言自动选择中文或 English，侧栏菜单可随时切换，无需重启服务。</p>
+          </div>
+          <div class="feat-card reveal">
+            <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.5 9a9 9 0 0 1 14.9-3.4L23 10"/><path d="M1 14l4.6 4.4A9 9 0 0 0 20.5 15"/></svg></div>
+            <h3 data-i18n="feat.f7t">更新提醒</h3>
+            <p data-i18n="feat.f7d">启动时检查 npm 上 @deepseek-ai/dsh 是否有更新的语义化版本，有则一键「立即更新」，失败自动回退。</p>
+          </div>
+          <div class="feat-card reveal">
+            <div class="feat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg></div>
+            <h3 data-i18n="feat.f8t">数据隔离</h3>
+            <p data-i18n="feat.f8d">服务数据独立存放于 ~/.dsh-desktop/dsh-home，可与已有的 ~/.dsh 做一次性的缺失项导入，互不覆盖。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 下载 -->
+    <section class="section" id="download">
+      <div class="container">
+        <p class="kicker reveal" data-i18n="dl.kicker">下载</p>
+        <h2 class="section-title reveal" data-i18n-html="dl.title">选择你的平台<span class="grad">开始</span></h2>
+        <p class="section-sub reveal" data-i18n="dl.sub">当前版本 v0.1.0。以下链接始终指向 GitHub Releases 的最新发布。</p>
+
+        <!--
+          下载地址说明：
+          链接指向 releases/latest/download/，始终下载最新版本。
+          如需固定 v0.1.0，把 latest 替换为 desktop-v0.1.0 即可，例如：
+          https://github.com/Gru110110110/deepseek-harness-desktop-launcher/releases/download/desktop-v0.1.0/DSHLauncher-macOS-arm64.dmg
+        -->
+        <div class="dl-grid">
+          <a class="dl-card reveal" data-platform="mac-arm64" href="https://github.com/Gru110110110/deepseek-harness-desktop-launcher/releases/latest/download/DSHLauncher-macOS-arm64.dmg">
+            <span class="dl-rec" data-i18n="dl.rec">推荐</span>
+            <div class="dl-os">macOS</div>
+            <div class="dl-arch" data-i18n="dl.macArm">Apple Silicon（M 系列芯片）</div>
+            <div class="dl-file">DSHLauncher-macOS-arm64.dmg</div>
+            <span class="dl-btn" data-i18n="dl.btn">下载 DMG</span>
+          </a>
+          <a class="dl-card reveal" data-platform="mac-x64" href="https://github.com/Gru110110110/deepseek-harness-desktop-launcher/releases/latest/download/DSHLauncher-macOS-x64.dmg">
+            <span class="dl-rec" data-i18n="dl.rec">推荐</span>
+            <div class="dl-os">macOS</div>
+            <div class="dl-arch" data-i18n="dl.macIntel">Intel 芯片</div>
+            <div class="dl-file">DSHLauncher-macOS-x64.dmg</div>
+            <span class="dl-btn" data-i18n="dl.btn">下载 DMG</span>
+          </a>
+          <a class="dl-card reveal" data-platform="win-x64" href="https://github.com/Gru110110110/deepseek-harness-desktop-launcher/releases/latest/download/DSHLauncher.exe">
+            <span class="dl-rec" data-i18n="dl.rec">推荐</span>
+            <div class="dl-os">Windows</div>
+            <div class="dl-arch">x64</div>
+            <div class="dl-file">DSHLauncher.exe</div>
+            <span class="dl-btn" data-i18n="dl.btnExe">下载 EXE</span>
+          </a>
+        </div>
+        <p class="dl-note reveal">
+          <span data-i18n="dl.note1">尚未配置代码签名：macOS 为 ad-hoc 签名，首次启动请右键「打开」；Windows 可能出现 SmartScreen 提示，选择「仍要运行」即可。</span>
+          <a href="https://github.com/Gru110110110/deepseek-harness-desktop-launcher/releases" target="_blank" rel="noopener" data-i18n="dl.all">查看全部历史版本 →</a>
+        </p>
+      </div>
+    </section>
+
+    <!-- FAQ -->
+    <section class="section" id="faq">
+      <div class="container container-narrow">
+        <p class="kicker reveal" data-i18n="faq.kicker">常见问题</p>
+        <h2 class="section-title reveal" data-i18n="faq.title">FAQ</h2>
+        <div class="faq-list">
+          <details class="faq-item reveal">
+            <summary data-i18n="faq.q1">它和 DeepSeek 官方是什么关系？</summary>
+            <p data-i18n="faq.a1">DSH Launcher 是非官方启动器。它运行的是未修改的官方 @deepseek-ai/dsh 包，该包仍受其自身许可条款约束；本仓库的 MIT 协议仅覆盖启动器自身代码。</p>
+          </details>
+          <details class="faq-item reveal">
+            <summary data-i18n="faq.q2">需要我自己安装 Node.js 吗？</summary>
+            <p data-i18n="faq.a2">不需要。首次启动时启动器会自动下载固定版本的 Node 归档（经 SHA-256 校验）并安装精确版本的 @deepseek-ai/dsh，全程在桌面窗口内完成。</p>
+          </details>
+          <details class="faq-item reveal">
+            <summary data-i18n="faq.q3">默认端口被占用了怎么办？</summary>
+            <p data-i18n="faq.a3">不用处理。服务报 EADDRINUSE 时，启动器会自动用官方 --port 0 让系统分配空闲端口重试，并始终显示服务发布的实际地址。</p>
+          </details>
+          <details class="faq-item reveal">
+            <summary data-i18n="faq.q4">我的会话和配置存在哪里？</summary>
+            <p data-i18n="faq.a4">全部在 ~/.dsh-desktop/ 下，与安装目录和已有的 ~/.dsh 相互隔离；升级启动器或更新 Harness 都不会丢失配置与会话。</p>
+          </details>
+          <details class="faq-item reveal">
+            <summary data-i18n="faq.q5">关闭窗口后服务还在吗？</summary>
+            <p data-i18n="faq.a5">在。关闭窗口只会把它隐藏到系统托盘，服务继续运行；想完全停止，请使用托盘菜单里的「退出」。</p>
+          </details>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <div class="footer-brand">
+        <img src="assets/logo.png" alt="" class="nav-logo" />
+        <span>DSH Launcher</span>
+      </div>
+      <p class="footer-note" data-i18n="footer.note">© 2026 DSH Launcher · MIT License</p>
+      <div class="footer-links">
+        <a href="https://github.com/Gru110110110/deepseek-harness-desktop-launcher" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/Gru110110110/deepseek-harness-desktop-launcher/releases" target="_blank" rel="noopener">Releases</a>
+        <a href="https://www.npmjs.com/package/@deepseek-ai/dsh" target="_blank" rel="noopener">@deepseek-ai/dsh</a>
+        <a href="https://github.com/deepseek-ai/deepseek-harness" target="_blank" rel="noopener">deepseek-harness</a>
+      </div>
+    </div>
+  </footer>
+
+  <script src="main.js"></script>
+</body>
+</html>

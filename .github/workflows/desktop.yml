@@ -1,0 +1,118 @@
+name: Build Desktop App
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "desktop-v*"
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            binary_arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+            binary_arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: ${{ matrix.arch }}
+
+      - name: Test desktop runtime and launcher
+        run: python -m unittest discover -s tests -v
+
+      - name: Verify runtime sources
+        run: python release_check.py
+
+      - name: Install desktop and build dependencies
+        run: python -m pip install -r requirements-runtime.txt -r requirements-build.txt
+
+      - name: Build macOS app
+        run: python -m PyInstaller --clean --noconfirm --distpath dist --workpath build-work build/mac.spec
+
+      - name: Verify packaged macOS architecture
+        run: |
+          ACTUAL_ARCHS="$(lipo -archs dist/DSHLauncher.app/Contents/MacOS/DSHLauncher)"
+          if [[ " $ACTUAL_ARCHS " != *" ${{ matrix.binary_arch }} "* ]]; then
+            echo "Package architecture mismatch: expected ${{ matrix.binary_arch }}, got $ACTUAL_ARCHS"
+            exit 1
+          fi
+
+      - name: Smoke packaged macOS app
+        env:
+          DSH_DESKTOP_HOME: ${{ runner.temp }}/dsh-desktop-smoke
+          DSH_HOME: ${{ runner.temp }}/dsh-home-smoke
+          DSH_DESKTOP_SOURCE_HOME: ${{ runner.temp }}/dsh-source-home-smoke
+        run: dist/DSHLauncher.app/Contents/MacOS/DSHLauncher --check
+
+      - name: Sign app (ad-hoc)
+        run: codesign --force --deep --sign - "dist/DSHLauncher.app"
+
+      - name: Create DMG
+        run: bash build/create_macos_dmg.sh "dist/DSHLauncher.app" "dist/DSHLauncher-macOS-${{ matrix.arch }}.dmg" "DSH Launcher"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-desktop-macos-${{ matrix.arch }}
+          path: dist/DSHLauncher-macOS-${{ matrix.arch }}.dmg
+
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Test desktop runtime and launcher
+        run: python -m unittest discover -s tests -v
+
+      - name: Verify runtime sources
+        run: python release_check.py
+
+      - name: Install desktop and build dependencies
+        run: python -m pip install -r requirements-runtime.txt -r requirements-build.txt
+
+      - name: Build Windows executable
+        run: python -m PyInstaller --clean --noconfirm --distpath dist --workpath build-work build/windows.spec
+
+      - name: Smoke packaged Windows executable
+        shell: pwsh
+        run: |
+          $env:DSH_DESKTOP_HOME = Join-Path $env:RUNNER_TEMP "dsh-desktop-smoke"
+          $env:DSH_HOME = Join-Path $env:RUNNER_TEMP "dsh-home-smoke"
+          $env:DSH_DESKTOP_SOURCE_HOME = Join-Path $env:RUNNER_TEMP "dsh-source-home-smoke"
+          & "dist/DSHLauncher.exe" --check
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-desktop-windows-x64
+          path: dist/DSHLauncher.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dsh-desktop-*
+          path: release
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/**

@@ -1,0 +1,4 @@
+# Git blob hashes from the last review that confirmed both languages agree.
+# Update both documents together, then replace these values with `git hash-object`.
+2026-08-16-desktop-runtime-deployment-reliability.md: ec1ad0b26a2d42eb35036d2eb9cac8a22e371665
+2026-08-16-desktop-runtime-deployment-reliability.zh.md: dcbbf7ac179f68a74c3a2c3277429f1b113cddf7
