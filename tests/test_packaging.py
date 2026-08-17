@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
@@ -46,6 +47,18 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(string_versions, {APP_VERSION})
         self.assertIn(f"filevers={fixed_version}".replace(" ", ""), normalized)
         self.assertIn(f"prodvers={fixed_version}".replace(" ", ""), normalized)
+
+    def test_cloudflare_static_deployment_targets_existing_worker(self) -> None:
+        config = json.loads(
+            (ROOT / "public" / "wrangler.jsonc").read_text(encoding="utf-8")
+        )
+        assets_ignore = (ROOT / "public" / ".assetsignore").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(config["name"], "deepseek-harness-desktop-launcher")
+        self.assertEqual(config["assets"]["directory"], ".")
+        self.assertIn("wrangler.jsonc", assets_ignore.splitlines())
 
 
 if __name__ == "__main__":

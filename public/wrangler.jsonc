@@ -1,0 +1,7 @@
+{
+  "name": "deepseek-harness-desktop-launcher",
+  "compatibility_date": "2026-08-16",
+  "assets": {
+    "directory": "."
+  }
+}
