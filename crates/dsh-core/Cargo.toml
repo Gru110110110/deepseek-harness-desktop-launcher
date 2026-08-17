@@ -1,0 +1,29 @@
+[package]
+name = "dsh-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fs2.workspace = true
+flate2.workspace = true
+hex.workspace = true
+libc.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sys-locale.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+ts-rs.workspace = true
+url.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+zip.workspace = true

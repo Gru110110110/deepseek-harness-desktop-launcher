@@ -1,0 +1,9 @@
+packages:
+  - "."
+
+autoInstallPeers: false
+
+# Vite requires esbuild's verified platform binary. Keep every other
+# dependency build script blocked unless it is reviewed and added explicitly.
+onlyBuiltDependencies:
+  - esbuild

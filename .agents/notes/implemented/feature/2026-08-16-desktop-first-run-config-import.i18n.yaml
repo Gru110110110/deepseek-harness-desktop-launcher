@@ -1,4 +1,0 @@
-# Git blob hashes from the last review that confirmed both languages agree.
-# Update both documents together, then replace these values with `git hash-object`.
-2026-08-16-desktop-first-run-config-import.md: 053823f7bc4f0a0e0a87d1e1491870898020cd0d
-2026-08-16-desktop-first-run-config-import.zh.md: 3aaaa67208b3b875e572a3c4ac010b6403d02c4e

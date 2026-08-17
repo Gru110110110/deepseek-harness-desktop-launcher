@@ -1,0 +1,60 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DSH Launcher",
+  "version": "0.2.0",
+  "identifier": "com.deepseek.dsh-launcher",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "DSH Launcher",
+        "width": 960,
+        "height": 640,
+        "minWidth": 720,
+        "minHeight": 520,
+        "center": true,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg", "nsis"],
+    "category": "DeveloperTool",
+    "shortDescription": "Desktop launcher for DeepSeek Harness",
+    "longDescription": "Installs and runs the published DeepSeek Harness web application in an isolated desktop runtime.",
+    "icon": ["../assets/icon.png", "../assets/icon.icns", "../assets/icon.ico"],
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false
+      },
+      "webviewInstallMode": { "type": "embedBootstrapper" }
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://dsdesktop.com/latest.json",
+        "https://github.com/Gru110110110/deepseek-harness-desktop-launcher/releases/latest/download/latest.json"
+      ],
+      "pubkey": ""
+    }
+  }
+}

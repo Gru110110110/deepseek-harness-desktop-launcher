@@ -1,0 +1,47 @@
+import { afterEach, describe, expect, it } from "vitest";
+import type { LauncherSnapshot } from "./generated/bindings";
+import { __launcherStoreTest } from "./launcherStore";
+
+function snapshot(
+  revision: number,
+  phase: LauncherSnapshot["phase"],
+): LauncherSnapshot {
+  return {
+    revision,
+    phase,
+    step: "prepare",
+    activity: null,
+    progress: { kind: "indeterminate" },
+    webUrl: null,
+    serviceStartedAtMs: null,
+    desktopVersion: "0.2.0",
+    harnessVersion: null,
+    desktopUpdate: { kind: "idle" },
+    harnessUpdate: { kind: "none" },
+    migration: { kind: "notRequired" },
+    browsers: [],
+    selectedBrowserId: "system",
+    language: "zh",
+    theme: "system",
+    trayAvailable: false,
+    error: null,
+  };
+}
+
+describe("launcher state stream", () => {
+  afterEach(() => {
+    __launcherStoreTest.reset();
+  });
+
+  it("rejects an event older than the current snapshot", () => {
+    __launcherStoreTest.accept(snapshot(5, "ready"));
+    __launcherStoreTest.accept(snapshot(4, "preparing"));
+    expect(__launcherStoreTest.current()?.phase).toBe("ready");
+  });
+
+  it("accepts a newer event", () => {
+    __launcherStoreTest.accept(snapshot(1, "preparing"));
+    __launcherStoreTest.accept(snapshot(2, "starting"));
+    expect(__launcherStoreTest.current()?.phase).toBe("starting");
+  });
+});

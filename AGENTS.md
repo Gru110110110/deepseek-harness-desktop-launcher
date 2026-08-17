@@ -1,6 +1,6 @@
 # AGENTS.md
 
-DSH Launcher is a Python/PyInstaller launcher for DeepSeek Harness that installs and runs the published `@deepseek-ai/dsh` package. Keep it independent from the Harness source workspace: integration happens through the published CLI and its documented output.
+DSH Launcher is a React/Tauri/Rust launcher for DeepSeek Harness that installs and runs the published `@deepseek-ai/dsh` package. Keep it independent from the Harness source workspace: integration happens through the published CLI and its documented output.
 
 ## Data safety
 
@@ -12,17 +12,23 @@ DSH Launcher is a Python/PyInstaller launcher for DeepSeek Harness that installs
 ## Commands
 
 ```sh
-python3.11 -m unittest discover -s tests -v
-python3.11 main.py --check
-./build-local.sh
+pnpm bindings
+pnpm lint
+pnpm test
+pnpm deadcode
+pnpm build
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Run `main.py --check` only with an isolated temporary `DSH_DESKTOP_HOME`. `build-local.bat` is the Windows packaging entry point.
+Run every Rust test, Tauri build, and package check with isolated temporary desktop, Harness, source, and CC Switch homes. `pnpm tauri build` is the packaging entry point; release CI produces macOS DMGs and a Windows per-user NSIS installer.
 
 ## Conventions
 
-- Support Python 3.11 with no runtime dependencies beyond the standard library; build-only dependencies belong in `requirements-build.txt`.
+- Keep business behavior in `dsh-core` without a Tauri dependency. Tauri commands adapt OS capabilities; React features own their route and navigation metadata.
+- Generate the frontend IPC contract from Rust with `pnpm bindings`; do not maintain duplicate handwritten domain types.
 - Keep subprocess calls shell-free and pass URLs and paths as separate arguments.
 - Validate downloaded Node archives against the pinned SHA-256 before extraction, reject archive traversal and links outside the expected top-level directory, and install an exact Harness version.
 - Keep English and Simplified Chinese UI dictionaries structurally identical. Update `README.md` and `README.zh.md` together.
-- Do not commit `.build-venv/`, `dist/`, PyInstaller work directories, `__pycache__/`, or platform metadata.
+- Tauri updater signatures are mandatory for releases; platform code signing remains optional. Never commit the updater private key.
+- Do not commit `node_modules/`, `target/`, `dist/`, TypeScript build info, or platform metadata.

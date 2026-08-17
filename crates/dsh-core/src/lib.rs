@@ -1,0 +1,19 @@
+//! Platform-independent application core for DSH Launcher.
+//!
+//! This crate deliberately has no Tauri dependency. Its services are usable in
+//! unit tests with isolated homes and by future UI surfaces without coupling
+//! product behavior to a specific window or command handler.
+
+pub mod browser;
+pub mod error;
+pub mod import;
+pub mod migration;
+pub mod model;
+pub mod paths;
+pub mod preferences;
+pub mod runtime;
+pub mod service;
+
+pub use error::{AppError, AppResult};
+pub use model::*;
+pub use paths::ApplicationPaths;

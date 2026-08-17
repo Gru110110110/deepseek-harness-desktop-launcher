@@ -1,4 +1,0 @@
-# Git blob hashes from the last review that confirmed both languages agree.
-# Update both documents together, then replace these values with `git hash-object`.
-README.md: 094c9b9aa497e16917574db621fbc34310a52f18
-README.zh.md: e3149ac5b611ad60a160d97ce0d7e8419100bc38

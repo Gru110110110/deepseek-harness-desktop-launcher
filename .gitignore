@@ -1,9 +1,16 @@
-# DeepSeek Harness desktop launcher build artifacts
+# DSH Launcher build artifacts
 .DS_Store
-.build-venv/
+node_modules/
+.pnpm-store/
+signer-keys/
+.wrangler/
+target/
 dist/
+*.tsbuildinfo
+# Ignored leftovers from pre-Tauri local builds; they are not release inputs.
+.build-venv/
+build-work/
 build/mac/
 build/windows/
-build-work/
 __pycache__/
 *.pyc

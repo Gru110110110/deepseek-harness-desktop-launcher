@@ -1,0 +1,144 @@
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
+
+use crate::{AppError, AppResult};
+
+#[derive(Debug, Clone)]
+pub struct ApplicationPaths {
+    pub app_home: PathBuf,
+    pub runtime_dir: PathBuf,
+    pub cache_dir: PathBuf,
+    pub node_dir: PathBuf,
+    pub node_bin: PathBuf,
+    pub dsh_dir: PathBuf,
+    pub dsh_bin: PathBuf,
+    pub version_file: PathBuf,
+    pub server_log: PathBuf,
+    pub install_log: PathBuf,
+    pub server_pid: PathBuf,
+    pub language_file: PathBuf,
+    pub preferences_file: PathBuf,
+    pub dsh_home: PathBuf,
+    pub home_import_marker: PathBuf,
+    pub workspace_import_marker: PathBuf,
+    pub cc_switch_import_marker: PathBuf,
+    pub migration_complete_marker: PathBuf,
+    pub migration_skip_marker: PathBuf,
+    pub migration_journal: PathBuf,
+    pub migration_lock: PathBuf,
+    pub migration_backups_dir: PathBuf,
+    pub deployment_lock: PathBuf,
+}
+
+impl ApplicationPaths {
+    pub fn from_environment() -> AppResult<Self> {
+        let app_home = if let Some(value) = env::var_os("DSH_DESKTOP_HOME") {
+            PathBuf::from(value)
+        } else {
+            dirs_home()?.join(".dsh-desktop")
+        };
+        Ok(Self::from_home(app_home))
+    }
+
+    pub fn from_home(app_home: impl Into<PathBuf>) -> Self {
+        let app_home = app_home.into();
+        let runtime_dir = app_home.join("runtime");
+        let node_dir = runtime_dir.join("node");
+        #[cfg(windows)]
+        let node_bin = node_dir.join("node.exe");
+        #[cfg(not(windows))]
+        let node_bin = node_dir.join("bin/node");
+        let dsh_dir = runtime_dir.join("dsh");
+        Self {
+            cache_dir: app_home.join("cache"),
+            node_bin,
+            dsh_bin: dsh_dir.join("node_modules/@deepseek-ai/dsh/lib/bin.js"),
+            version_file: runtime_dir.join("runtime.version"),
+            server_log: app_home.join("server.log"),
+            install_log: app_home.join("install.log"),
+            server_pid: app_home.join("server.pid"),
+            language_file: app_home.join("language"),
+            preferences_file: app_home.join("preferences.json"),
+            dsh_home: app_home.join("dsh-home"),
+            home_import_marker: app_home.join(".source-home-import-v1"),
+            workspace_import_marker: app_home.join(".source-workspace-import-v1"),
+            cc_switch_import_marker: app_home.join(".cc-switch-import-v2"),
+            migration_complete_marker: app_home.join(".migration-complete-v1"),
+            migration_skip_marker: app_home.join(".migration-skip-v1"),
+            migration_journal: app_home.join(".migration-journal-v1.json"),
+            migration_lock: app_home.join(".migration.lock"),
+            migration_backups_dir: app_home.join("backups"),
+            deployment_lock: runtime_dir.join(".deployment.lock"),
+            app_home,
+            runtime_dir,
+            node_dir,
+            dsh_dir,
+        }
+    }
+
+    pub fn ensure_dirs(&self) -> AppResult<()> {
+        for path in [
+            &self.app_home,
+            &self.runtime_dir,
+            &self.cache_dir,
+            &self.dsh_home,
+        ] {
+            std::fs::create_dir_all(path)
+                .map_err(|e| AppError::io("createDirectory", &e).value("path", path.display()))?;
+        }
+        Ok(())
+    }
+}
+
+pub fn dirs_home() -> AppResult<PathBuf> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| AppError::new("homeUnavailable"))
+}
+
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
+    use std::io::Write;
+    let parent = path.parent().ok_or_else(|| AppError::new("invalidPath"))?;
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o600))?;
+    }
+    temporary.as_file_mut().write_all(bytes)?;
+    temporary.as_file_mut().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|e| AppError::io("writeFailed", &e.error))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_layout_remains_stable() {
+        let paths = ApplicationPaths::from_home("dsh-layout-contract");
+        assert!(paths.node_bin.ends_with(if cfg!(windows) {
+            "runtime/node/node.exe"
+        } else {
+            "runtime/node/bin/node"
+        }));
+        assert!(
+            paths
+                .dsh_bin
+                .ends_with("runtime/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js")
+        );
+        assert!(paths.dsh_home.ends_with("dsh-home"));
+        assert!(
+            paths
+                .cc_switch_import_marker
+                .ends_with(".cc-switch-import-v2")
+        );
+    }
+}

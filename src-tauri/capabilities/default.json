@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The launcher UI can receive state and call the narrow typed command surface.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
