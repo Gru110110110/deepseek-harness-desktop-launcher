@@ -78,7 +78,9 @@ deepseek-harness-desktop/
 ├── THIRD_PARTY_NOTICES.md   # 打包依赖的许可证说明
 ├── build/
 │   ├── mac.spec             # macOS .app 打包配置
-│   ├── windows.spec         # Windows 单文件 exe 打包配置
+│   ├── windows.spec         # Windows onedir packaging (avoids self-extraction)
+│   ├── package_windows.ps1  # Creates the distributable Windows ZIP
+│   ├── sign_windows.ps1     # Optional Authenticode signing in CI
 │   ├── create_macos_dmg.sh  # 制作 DMG
 │   └── generate_icons.py    # Generate checked-in app icons (maintenance only)
 ├── tests/                   # 非 GUI 模块的单元测试
@@ -97,7 +99,7 @@ macOS (produces an `.app` and DMG):
 ./build-local.sh
 ```
 
-Windows (produces `DSHLauncher.exe`):
+Windows (produces `DSHLauncher-Windows-x64.zip`):
 
 ```bat
 build-local.bat
@@ -110,7 +112,7 @@ Artifacts are written to `dist/`. The runtime (Node and dsh) downloads and insta
 Workflow: `.github/workflows/desktop.yml`.
 
 - **Manual:** On the Actions page, choose *Build Desktop App* → *Run workflow*. Packages are uploaded as artifacts without creating a Release.
-- **Release:** Pushing a `desktop-v*` tag, such as `desktop-v0.1.0`, runs the desktop suite, verifies the pinned Node metadata and valid Harness `latest` metadata through the official and npmmirror transports, builds macOS (arm64/x64) and Windows (x64), smokes each packaged launcher through `--check`, and creates a GitHub Release.
+- **Release:** Pushing a `desktop-v*` tag, such as `desktop-v0.1.1`, runs the desktop suite, verifies the pinned Node metadata and valid Harness `latest` metadata through the official and npmmirror transports, builds macOS (arm64/x64) and Windows (x64), smokes each packaged launcher through `--check`, generates `SHA256SUMS.txt`, and creates a GitHub Release.
 
 ## Release process
 
@@ -118,11 +120,11 @@ Workflow: `.github/workflows/desktop.yml`.
 2. Create and push the tag:
 
    ```sh
-   git tag desktop-v0.1.0
-   git push origin desktop-v0.1.0
+   git tag desktop-v0.1.1
+   git push origin desktop-v0.1.1
    ```
 
-3. Download the platform package (`.dmg` or `.exe`) from the Release and distribute it.
+3. Download the platform package (`.dmg` or the Windows `.zip`) and `SHA256SUMS.txt` from the Release and distribute them together.
 
 ## Tests
 
@@ -149,7 +151,9 @@ python3.11 -m unittest discover -s tests -v
 
 ## Notes
 
-- **Code signing:** No Apple or Windows signing certificate is configured. macOS builds use ad-hoc signing, so first launch may require right-clicking the app and choosing “Open” or following the system prompt. Windows may show a SmartScreen prompt.
+- **Windows antivirus compatibility:** Windows is built as a PyInstaller one-folder application and distributed as `DSHLauncher-Windows-x64.zip`. This removes the one-file bootloader's runtime self-extraction, a common heuristic false-positive trigger. Extract the complete `DSHLauncher` folder before running `DSHLauncher.exe`; do not move the EXE away from its `_internal` directory.
+- **Optional Windows signing:** Releases remain buildable without a certificate. To Authenticode-sign the launcher in GitHub Actions, configure repository secrets `WINDOWS_SIGNING_CERT_BASE64` (the Base64-encoded PFX) and `WINDOWS_SIGNING_CERT_PASSWORD`; the workflow signs with SHA-256, adds an RFC 3161 timestamp, and verifies the signature before creating the ZIP. `WINDOWS_TIMESTAMP_URL` may be set as a repository variable to override the default timestamp service.
+- **macOS signing:** macOS remains independently buildable with ad-hoc signing; first launch may require right-clicking the app and choosing “Open” or following the system prompt. Developer ID signing and notarization are optional future hardening, not a build requirement. macOS does not use the Windows one-file bootloader and therefore does not need the Windows packaging change.
 - **macOS architecture builds:** Apple Silicon packages use the `macos-15` runner and Intel packages use `macos-15-intel`. CI and the local build script verify the packaged launcher's Mach-O architecture with `lipo` before creating or uploading the DMG.
 - **Runtime deployment:** Official Node/npm endpoints and npmmirror serve as default transports, but SHA-256 and exact versions determine admitted content. Partial Node downloads and npm's content cache survive retry. One cross-process lock serializes writers; staging directories, executable smokes, atomic markers, retained previous directories, and startup recovery prevent an interrupted or failed update from replacing the last valid runtime. The npm subprocess receives proxy and certificate settings but not ambient API keys, passwords, tokens, or the user's npm configuration.
 - **Address discovery:** The launcher first uses the official default address. Only when the service reports `EADDRINUSE` does it retry with the official `--port 0` option so the operating system selects a free loopback port. The official `dsh web: <URL>` output remains the readiness signal and sole displayed and opened address. If the service exits for another reason or does not announce an address within 60 seconds, the launcher stops it and reports the failure; it never substitutes a desktop-owned host or port.

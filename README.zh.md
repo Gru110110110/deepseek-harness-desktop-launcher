@@ -78,7 +78,9 @@ deepseek-harness-desktop/
 ├── THIRD_PARTY_NOTICES.md   # 打包依赖的许可证说明
 ├── build/
 │   ├── mac.spec             # macOS .app 打包配置
-│   ├── windows.spec         # Windows 单文件 exe 打包配置
+│   ├── windows.spec         # Windows onedir 打包配置（不再自解压）
+│   ├── package_windows.ps1  # 生成 Windows 发布 ZIP
+│   ├── sign_windows.ps1     # CI 中可选的 Authenticode 签名
 │   ├── create_macos_dmg.sh  # 制作 DMG
 │   └── generate_icons.py    # 生成已签入的应用图标（维护用）
 ├── tests/                   # 非 GUI 模块的单元测试
@@ -97,7 +99,7 @@ macOS（生成 `.app` 与 DMG）：
 ./build-local.sh
 ```
 
-Windows（生成 `DSHLauncher.exe`）：
+Windows（生成 `DSHLauncher-Windows-x64.zip`）：
 
 ```bat
 build-local.bat
@@ -110,7 +112,7 @@ build-local.bat
 工作流：`.github/workflows/desktop.yml`。
 
 - **手动触发**：在 Actions 页选择 *Build Desktop App* → *Run workflow*，产物以 artifacts 形式上传（不含 Release）。
-- **自动发版**：推送 `desktop-v*` 标签（如 `desktop-v0.1.0`）时，运行 desktop 测试、通过官方源与 npmmirror 验证固定的 Node 元数据及有效的 Harness `latest` 元数据、构建 macOS (arm64/x64) 与 Windows (x64) 安装包、通过 `--check` 冒烟测试每个打包启动器，并创建 GitHub Release。
+- **自动发版**：推送 `desktop-v*` 标签（如 `desktop-v0.1.1`）时，运行 desktop 测试、通过官方源与 npmmirror 验证固定的 Node 元数据及有效的 Harness `latest` 元数据、构建 macOS (arm64/x64) 与 Windows (x64) 安装包、通过 `--check` 冒烟测试每个打包启动器、生成 `SHA256SUMS.txt`，并创建 GitHub Release。
 
 ## 发版流程
 
@@ -118,11 +120,11 @@ build-local.bat
 2. 打标签并推送，触发构建与发版：
 
    ```sh
-   git tag desktop-v0.1.0
-   git push origin desktop-v0.1.0
+   git tag desktop-v0.1.1
+   git push origin desktop-v0.1.1
    ```
 
-3. 从 Release 下载对应平台的安装包（`.dmg` / `.exe`）分发给用户。
+3. 从 Release 下载对应平台的安装包（`.dmg` / Windows `.zip`）及 `SHA256SUMS.txt`，一并分发给用户。
 
 ## 测试
 
@@ -149,7 +151,9 @@ python3.11 -m unittest discover -s tests -v
 
 ## 注意事项
 
-- **代码签名**：当前未配置 Apple/Windows 代码签名证书，macOS 构建使用 ad-hoc 签名。首次打开需右键 →「打开」，或参考系统提示放行；Windows 可能出现 SmartScreen 提示。
+- **Windows 杀毒兼容性**：Windows 改为 PyInstaller 单目录应用，并以 `DSHLauncher-Windows-x64.zip` 分发，去掉单文件 bootloader 运行时自解压这一常见启发式误报源。使用时要先完整解压 `DSHLauncher` 文件夹，再运行其中的 `DSHLauncher.exe`；不要把 EXE 单独移出 `_internal` 目录。
+- **Windows 可选签名**：没有证书时仍可正常构建和发布。若以后需要 Authenticode，在 GitHub 仓库中配置 `WINDOWS_SIGNING_CERT_BASE64`（PFX 的 Base64 内容）与 `WINDOWS_SIGNING_CERT_PASSWORD` 两个 Secrets；工作流会使用 SHA-256 与 RFC 3161 时间戳签名，并在生成 ZIP 前验证签名。可用仓库变量 `WINDOWS_TIMESTAMP_URL` 覆盖默认时间戳服务。
+- **macOS 签名**：macOS 保持 ad-hoc 签名且不阻止发布，首次打开可能仍需右键 →「打开」或按系统提示放行。Developer ID 签名和公证属于可选的后续增强，不是构建前提；macOS 本来就不是 Windows 的单文件 bootloader，因此无需套用此次 Windows 打包改造。
 - **macOS 架构构建**：Apple Silicon 安装包使用 `macos-15` 运行器，Intel 安装包使用 `macos-15-intel`。CI 与本地构建脚本都会在创建或上传 DMG 前通过 `lipo` 校验启动器的实际 Mach-O 架构。
 - **运行时部署**：Node/npm 官方端点与 npmmirror 是默认传输源，但只有 SHA-256 和精确版本决定哪些内容可以进入安装。Node 部分下载与 npm 内容缓存可跨重试保留。跨进程锁会串行化写入方；staging 目录、可执行 smoke、原子版本标记、保留的前一目录和启动恢复共同防止中断或失败更新替换最后一份有效运行时。npm 子进程会接收代理与证书设置，但不会接收环境中的 API key、密码、token 或用户 npm 配置。
 - **地址发现**：启动器首先使用官方默认地址。仅当服务报告 `EADDRINUSE` 时，才用官方 `--port 0` 参数重试，让操作系统选择空闲的回环端口。官方 `dsh web: <URL>` 输出始终是就绪信号，以及唯一显示和打开的地址。若服务因其他原因退出或 60 秒内没有发布地址，启动器会停止服务并报告失败，绝不使用桌面端自行设定的 host 或端口作为回退。

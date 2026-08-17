@@ -1,6 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
-# PyInstaller spec: one-file executable for the Windows desktop launcher.
+# PyInstaller spec: one-folder application for the Windows desktop launcher.
+#
+# The folder layout is intentional. PyInstaller's one-file bootloader extracts
+# an embedded archive at runtime, a pattern that is prone to heuristic antivirus
+# false positives. The release workflow packages this directory as a ZIP.
 import sys
 from importlib.metadata import distribution
 from pathlib import Path
@@ -42,9 +46,8 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="DSHLauncher",
     debug=False,
     bootloader_ignore_signals=False,
@@ -52,4 +55,13 @@ exe = EXE(
     upx=False,
     console=False,
     icon=str(icon),
+    version=str(root / "build" / "windows-version-info.txt"),
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="DSHLauncher",
 )

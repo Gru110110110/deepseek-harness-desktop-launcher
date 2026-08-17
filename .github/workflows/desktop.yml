@@ -97,21 +97,33 @@ jobs:
       - name: Install desktop and build dependencies
         run: python -m pip install -r requirements-runtime.txt -r requirements-build.txt
 
-      - name: Build Windows executable
+      - name: Build Windows application
         run: python -m PyInstaller --clean --noconfirm --distpath dist --workpath build-work build/windows.spec
 
-      - name: Smoke packaged Windows executable
+      - name: Smoke packaged Windows application
         shell: pwsh
         run: |
           $env:DSH_DESKTOP_HOME = Join-Path $env:RUNNER_TEMP "dsh-desktop-smoke"
           $env:DSH_HOME = Join-Path $env:RUNNER_TEMP "dsh-home-smoke"
           $env:DSH_DESKTOP_SOURCE_HOME = Join-Path $env:RUNNER_TEMP "dsh-source-home-smoke"
-          & "dist/DSHLauncher.exe" --check
+          & "dist/DSHLauncher/DSHLauncher.exe" --check
+
+      - name: Sign Windows launcher when a certificate is configured
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 }}
+          WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: ./build/sign_windows.ps1 -Executable dist/DSHLauncher/DSHLauncher.exe
+
+      - name: Package Windows application
+        shell: pwsh
+        run: ./build/package_windows.ps1 -SourceDirectory dist/DSHLauncher -DestinationArchive dist/DSHLauncher-Windows-x64.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: dsh-desktop-windows-x64
-          path: dist/DSHLauncher.exe
+          path: dist/DSHLauncher-Windows-x64.zip
 
   release:
     if: startsWith(github.ref, 'refs/tags/desktop-v')
@@ -123,6 +135,9 @@ jobs:
           pattern: dsh-desktop-*
           path: release
           merge-multiple: true
+      - name: Generate SHA-256 checksums
+        working-directory: release
+        run: sha256sum DSHLauncher-macOS-*.dmg DSHLauncher-Windows-x64.zip > SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:
           files: release/**

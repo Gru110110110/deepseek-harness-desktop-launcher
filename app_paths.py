@@ -18,7 +18,7 @@ from pathlib import Path
 APP_NAME = "DSH Launcher"
 APP_ID = "dsh-desktop"
 # The desktop shell's own version.
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 
 # The desktop release pins one exact Node build whose per-platform hashes live in
 # runtime.py. A version override must supply DSH_DESKTOP_NODE_SHA256 as its trust

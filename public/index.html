@@ -55,7 +55,7 @@
     <section class="hero">
       <div class="container">
         <div class="hero-badges reveal">
-          <span class="badge"><i class="dot"></i><span data-i18n="hero.badge">v0.1.0 早期预览 · MIT 开源</span></span>
+          <span class="badge"><i class="dot"></i><span data-i18n="hero.badge">v0.1.1 早期预览 · MIT 开源</span></span>
           <span class="badge badge-dim" data-i18n="hero.badge2">非官方启动器 · 不改动官方 Harness</span>
         </div>
         <h1 class="hero-title reveal" data-i18n-html="hero.title">
@@ -123,7 +123,7 @@
           <div class="step reveal">
             <div class="step-num">01</div>
             <h3 data-i18n="how.s1t">下载安装</h3>
-            <p data-i18n="how.s1d">一个 DMG 或 EXE，拖进应用程序即完成安装。不需要自己装 Node，不需要敲任何命令。</p>
+            <p data-i18n="how.s1d">macOS 下载 DMG，Windows 下载 ZIP 并解压。不需要自己装 Node，不需要敲任何命令。</p>
           </div>
           <div class="step-arrow" aria-hidden="true">→</div>
           <div class="step reveal">
@@ -224,13 +224,13 @@
       <div class="container">
         <p class="kicker reveal" data-i18n="dl.kicker">下载</p>
         <h2 class="section-title reveal" data-i18n-html="dl.title">选择你的平台<span class="grad">开始</span></h2>
-        <p class="section-sub reveal" data-i18n="dl.sub">当前版本 v0.1.0。以下链接始终指向 GitHub Releases 的最新发布。</p>
+        <p class="section-sub reveal" data-i18n="dl.sub">当前版本 v0.1.1。以下链接始终指向 GitHub Releases 的最新发布。</p>
 
         <!--
           下载地址说明：
           链接指向 releases/latest/download/，始终下载最新版本。
-          如需固定 v0.1.0，把 latest 替换为 desktop-v0.1.0 即可，例如：
-          https://github.com/Gru110110110/deepseek-harness-desktop-launcher/releases/download/desktop-v0.1.0/DSHLauncher-macOS-arm64.dmg
+          如需固定 v0.1.1，把 latest 替换为 desktop-v0.1.1 即可，例如：
+          https://github.com/Gru110110110/deepseek-harness-desktop-launcher/releases/download/desktop-v0.1.1/DSHLauncher-macOS-arm64.dmg
         -->
         <div class="dl-grid">
           <a class="dl-card reveal" data-platform="mac-arm64" href="https://github.com/Gru110110110/deepseek-harness-desktop-launcher/releases/latest/download/DSHLauncher-macOS-arm64.dmg">
@@ -247,16 +247,16 @@
             <div class="dl-file">DSHLauncher-macOS-x64.dmg</div>
             <span class="dl-btn" data-i18n="dl.btn">下载 DMG</span>
           </a>
-          <a class="dl-card reveal" data-platform="win-x64" href="https://github.com/Gru110110110/deepseek-harness-desktop-launcher/releases/latest/download/DSHLauncher.exe">
+          <a class="dl-card reveal" data-platform="win-x64" href="https://github.com/Gru110110110/deepseek-harness-desktop-launcher/releases/latest/download/DSHLauncher-Windows-x64.zip">
             <span class="dl-rec" data-i18n="dl.rec">推荐</span>
             <div class="dl-os">Windows</div>
             <div class="dl-arch">x64</div>
-            <div class="dl-file">DSHLauncher.exe</div>
-            <span class="dl-btn" data-i18n="dl.btnExe">下载 EXE</span>
+            <div class="dl-file">DSHLauncher-Windows-x64.zip</div>
+            <span class="dl-btn" data-i18n="dl.btnZip">下载 ZIP</span>
           </a>
         </div>
         <p class="dl-note reveal">
-          <span data-i18n="dl.note1">尚未配置代码签名：macOS 为 ad-hoc 签名，首次启动请右键「打开」；Windows 可能出现 SmartScreen 提示，选择「仍要运行」即可。</span>
+          <span data-i18n="dl.note1">Windows 使用非自解压 ZIP 目录包以降低杀毒软件误报；解压后运行 DSHLauncher.exe。macOS 当前为 ad-hoc 签名，首次启动请右键「打开」。</span>
           <a href="https://github.com/Gru110110110/deepseek-harness-desktop-launcher/releases" target="_blank" rel="noopener" data-i18n="dl.all">查看全部历史版本 →</a>
         </p>
       </div>

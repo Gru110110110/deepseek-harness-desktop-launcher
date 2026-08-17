@@ -1,6 +1,6 @@
 @echo off
 rem SPDX-License-Identifier: MIT
-rem Build the Windows desktop launcher (DSHLauncher.exe) from a local checkout.
+rem Build the Windows desktop launcher directory and ZIP from a local checkout.
 setlocal EnableExtensions
 cd /d "%~dp0"
 
@@ -26,10 +26,12 @@ if errorlevel 1 exit /b 1
 "%BUILD_VENV%\Scripts\python.exe" -m pip install -r requirements-build.txt
 if errorlevel 1 exit /b 1
 
-echo [3/3] Building the Windows executable...
+echo [3/3] Building and packaging the Windows application...
 "%BUILD_VENV%\Scripts\python.exe" -m PyInstaller --clean --noconfirm --distpath dist --workpath build-work build\windows.spec
+if errorlevel 1 exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File build\package_windows.ps1 -SourceDirectory dist\DSHLauncher -DestinationArchive dist\DSHLauncher-Windows-x64.zip
 if errorlevel 1 exit /b 1
 
 echo.
-echo Build complete: %CD%\dist\DSHLauncher.exe
+echo Build complete: %CD%\dist\DSHLauncher-Windows-x64.zip
 endlocal
