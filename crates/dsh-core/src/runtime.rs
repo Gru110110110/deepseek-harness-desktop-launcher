@@ -519,12 +519,20 @@ fn download_once(
     if Instant::now() >= deadline {
         return Err(AppError::new("downloadTimedOut"));
     }
+    let remaining = deadline.saturating_duration_since(Instant::now());
     remove_owned(partial)?;
     let mut response = client
         .get(url)
+        .timeout(remaining)
         .send()
         .and_then(|item| item.error_for_status())
-        .map_err(|error| AppError::new("downloadFailed").detail(error.to_string()))?;
+        .map_err(|error| {
+            if error.is_timeout() || Instant::now() >= deadline {
+                AppError::new("downloadTimedOut")
+            } else {
+                AppError::new("downloadFailed").detail(error.to_string())
+            }
+        })?;
     let total = response.content_length();
     if total.is_some_and(|size| size > MAX_NODE_ARCHIVE_BYTES) {
         return Err(AppError::new("downloadTooLarge"));
@@ -537,9 +545,13 @@ fn download_once(
         if Instant::now() >= deadline {
             return Err(AppError::new("downloadTimedOut"));
         }
-        let count = response
-            .read(&mut buffer)
-            .map_err(|error| AppError::io("downloadFailed", &error))?;
+        let count = response.read(&mut buffer).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut || Instant::now() >= deadline {
+                AppError::new("downloadTimedOut")
+            } else {
+                AppError::io("downloadFailed", &error)
+            }
+        })?;
         if Instant::now() >= deadline {
             return Err(AppError::new("downloadTimedOut"));
         }
@@ -1273,21 +1285,19 @@ mod tests {
     #[test]
     fn download_deadline_is_enforced_while_streaming() {
         let (url, server) = serve_once(|mut stream| {
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
-            for _ in 0..10 {
-                if stream.write_all(&[1u8; 1024]).is_err() {
-                    break;
-                }
-                let _ = stream.flush();
-                thread::sleep(Duration::from_millis(20));
-            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2048\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(&[1u8; 1024]);
+            let _ = stream.flush();
+            thread::sleep(Duration::from_millis(100));
+            let _ = stream.write_all(&[1u8; 1024]);
         });
         let temp = tempfile::tempdir().unwrap();
         let error = download_once(
             &http_client().unwrap(),
             &url,
             &temp.path().join("archive.part"),
-            Instant::now() + Duration::from_millis(10),
+            Instant::now() + Duration::from_millis(20),
             &DeploymentController::default(),
             &|_| {},
         )

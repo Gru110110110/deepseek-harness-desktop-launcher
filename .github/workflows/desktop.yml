@@ -10,15 +10,18 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  DSH_DESKTOP_HOME: ${{ runner.temp }}/dsh-desktop-tests
-  DSH_HOME: ${{ runner.temp }}/dsh-home-tests
-  DSH_DESKTOP_SOURCE_HOME: ${{ runner.temp }}/dsh-source-home-tests
-  DSH_DESKTOP_CC_SWITCH_HOME: ${{ runner.temp }}/cc-switch-home-tests
 
 jobs:
   validate:
     runs-on: macos-15
     steps:
+      - name: Configure isolated data homes
+        shell: bash
+        run: |
+          echo "DSH_DESKTOP_HOME=$RUNNER_TEMP/dsh-desktop-tests" >> "$GITHUB_ENV"
+          echo "DSH_HOME=$RUNNER_TEMP/dsh-home-tests" >> "$GITHUB_ENV"
+          echo "DSH_DESKTOP_SOURCE_HOME=$RUNNER_TEMP/dsh-source-home-tests" >> "$GITHUB_ENV"
+          echo "DSH_DESKTOP_CC_SWITCH_HOME=$RUNNER_TEMP/cc-switch-home-tests" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
         with:
@@ -87,6 +90,13 @@ jobs:
       TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - name: Configure isolated data homes
+        shell: bash
+        run: |
+          echo "DSH_DESKTOP_HOME=$RUNNER_TEMP/dsh-desktop-tests" >> "$GITHUB_ENV"
+          echo "DSH_HOME=$RUNNER_TEMP/dsh-home-tests" >> "$GITHUB_ENV"
+          echo "DSH_DESKTOP_SOURCE_HOME=$RUNNER_TEMP/dsh-source-home-tests" >> "$GITHUB_ENV"
+          echo "DSH_DESKTOP_CC_SWITCH_HOME=$RUNNER_TEMP/cc-switch-home-tests" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
         with:
@@ -108,19 +118,8 @@ jobs:
           node scripts/write-release-config.mjs "$RUNNER_TEMP/tauri.release.json"
       - name: Build signed updater artifacts
         uses: tauri-apps/tauri-action@944946e3e4cac6603d1fe8f514171e9ecd3c78aa # v1
-        if: ${{ !startsWith(github.ref, 'refs/tags/desktop-v') }}
         with:
-          args: --config "${{ runner.temp }}/tauri.release.json" --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
-      - name: Build and publish release artifacts
-        uses: tauri-apps/tauri-action@944946e3e4cac6603d1fe8f514171e9ecd3c78aa # v1
-        if: ${{ startsWith(github.ref, 'refs/tags/desktop-v') }}
-        with:
-          tagName: desktop-v__VERSION__
-          releaseName: DSH Launcher v__VERSION__
-          releaseBody: See the repository changelog and installation guide for this release.
-          releaseDraft: true
-          prerelease: false
-          uploadUpdaterJson: false
+          retryAttempts: 3
           args: --config "${{ runner.temp }}/tauri.release.json" --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
       - name: Require signed updater artifacts
         shell: bash
@@ -140,36 +139,118 @@ jobs:
             test "${#signatures[@]}" -eq "${#archives[@]}"
           fi
 
-      - name: Smoke installed package
+      - name: Smoke installed Windows package
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        timeout-minutes: 6
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Invoke-ProcessWithTimeout {
+            param(
+              [Parameter(Mandatory)] [string] $Label,
+              [Parameter(Mandatory)] [string] $FilePath,
+              [string[]] $ArgumentList = @(),
+              [Parameter(Mandatory)] [int] $TimeoutSeconds
+            )
+
+            Write-Host "::group::$Label"
+            try {
+              Write-Host "Starting $FilePath $($ArgumentList -join ' ')"
+              $process = Start-Process `
+                -FilePath $FilePath `
+                -ArgumentList $ArgumentList `
+                -NoNewWindow `
+                -PassThru
+
+              if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+                Write-Host "Process tree at timeout:"
+                Get-CimInstance Win32_Process |
+                  Where-Object { $_.ProcessId -eq $process.Id -or $_.ParentProcessId -eq $process.Id } |
+                  Select-Object ProcessId, ParentProcessId, Name, CommandLine |
+                  Format-Table -AutoSize |
+                  Out-Host
+                & taskkill.exe /PID $process.Id /T /F | Out-Host
+                throw "$Label exceeded its ${TimeoutSeconds}s timeout"
+              }
+
+              if ($process.ExitCode -ne 0) {
+                throw "$Label failed with exit code $($process.ExitCode)"
+              }
+              Write-Host "$Label completed"
+            } finally {
+              Write-Host "::endgroup::"
+            }
+          }
+
+          $installers = @(Get-ChildItem `
+            -Path "target/${{ matrix.target }}/release/bundle/nsis/*.exe" `
+            -File)
+          if ($installers.Count -ne 1) {
+            throw "Expected one NSIS installer, found $($installers.Count)"
+          }
+
+          $installRoot = Join-Path $env:RUNNER_TEMP "dsh-installer-smoke"
+          New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
+          Invoke-ProcessWithTimeout `
+            -Label "Install NSIS package" `
+            -FilePath $installers[0].FullName `
+            -ArgumentList @("/S", "/D=$installRoot") `
+            -TimeoutSeconds 180
+
+          $executables = @(Get-ChildItem `
+            -Path $installRoot `
+            -Filter "dsh-launcher.exe" `
+            -File `
+            -Recurse)
+          if ($executables.Count -ne 1) {
+            throw "Expected one installed launcher, found $($executables.Count)"
+          }
+
+          Invoke-ProcessWithTimeout `
+            -Label "Read installed launcher version" `
+            -FilePath $executables[0].FullName `
+            -ArgumentList @("--desktop-version") `
+            -TimeoutSeconds 30
+          Invoke-ProcessWithTimeout `
+            -Label "Check installed launcher" `
+            -FilePath $executables[0].FullName `
+            -ArgumentList @("--check") `
+            -TimeoutSeconds 30
+
+          $uninstallers = @(Get-ChildItem `
+            -Path $installRoot `
+            -Filter "uninstall.exe" `
+            -File `
+            -Recurse)
+          if ($uninstallers.Count -ne 1) {
+            throw "Expected one uninstaller, found $($uninstallers.Count)"
+          }
+          Invoke-ProcessWithTimeout `
+            -Label "Uninstall NSIS package" `
+            -FilePath $uninstallers[0].FullName `
+            -ArgumentList @("/S") `
+            -TimeoutSeconds 60
+
+      - name: Smoke installed macOS package
+        if: ${{ runner.os != 'Windows' }}
         shell: bash
+        timeout-minutes: 3
         run: |
           shopt -s nullglob
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            installer=(target/${{ matrix.target }}/release/bundle/nsis/*.exe)
-            install_root="$RUNNER_TEMP/dsh-installer-smoke"
-            install_root_windows="$(cygpath -w "$install_root")"
-            "${installer[0]}" /S "/D=$install_root_windows"
-            executable="$(find "$install_root" -type f -iname '*.exe' ! -iname 'uninstall.exe' -print -quit)"
-            test -n "$executable"
-            "$executable" --desktop-version
-            "$executable" --check
-            uninstaller="$(find "$install_root" -type f -iname 'uninstall.exe' -print -quit)"
-            if [[ -n "$uninstaller" ]]; then "$uninstaller" /S; fi
-          else
-            dmg=(target/${{ matrix.target }}/release/bundle/dmg/*.dmg)
-            mount_point="$RUNNER_TEMP/dsh-dmg-smoke"
-            mkdir -p "$mount_point"
-            cleanup() { hdiutil detach "$mount_point" -quiet || true; }
-            trap cleanup EXIT
-            hdiutil attach -readonly -nobrowse -mountpoint "$mount_point" "${dmg[0]}"
-            app_bundle="$(find "$mount_point" -maxdepth 2 -type d -name '*.app' -print -quit)"
-            test -n "$app_bundle"
-            codesign --verify --deep --strict --verbose=2 "$app_bundle"
-            executable="$(find "$mount_point" -path '*/Contents/MacOS/dsh-launcher' -type f -print -quit)"
-            test -n "$executable"
-            "$executable" --desktop-version
-            "$executable" --check
-          fi
+          dmg=(target/${{ matrix.target }}/release/bundle/dmg/*.dmg)
+          mount_point="$RUNNER_TEMP/dsh-dmg-smoke"
+          mkdir -p "$mount_point"
+          cleanup() { hdiutil detach "$mount_point" -quiet || true; }
+          trap cleanup EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_point" "${dmg[0]}"
+          app_bundle="$(find "$mount_point" -maxdepth 2 -type d -name '*.app' -print -quit)"
+          test -n "$app_bundle"
+          codesign --verify --deep --strict --verbose=2 "$app_bundle"
+          executable="$(find "$mount_point" -path '*/Contents/MacOS/dsh-launcher' -type f -print -quit)"
+          test -n "$executable"
+          "$executable" --desktop-version
+          "$executable" --check
       - uses: actions/upload-artifact@v4
         with:
           name: dsh-launcher-${{ matrix.artifact }}
@@ -192,6 +273,24 @@ jobs:
           pattern: dsh-launcher-*
           path: ${{ runner.temp }}/release-artifacts
           merge-multiple: false
+      - name: Stage and upload the complete draft release
+        run: |
+          node scripts/stage-release-assets.mjs "$RUNNER_TEMP/release-artifacts" "$RUNNER_TEMP/release-assets"
+          release_state="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [[ -n "$release_state" && "$release_state" != "true" ]]; then
+            echo "Refusing to replace a published release" >&2
+            exit 1
+          fi
+          if [[ "$release_state" == "true" ]]; then
+            gh release delete "$GITHUB_REF_NAME" --yes
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "DSH Launcher v${GITHUB_REF_NAME#desktop-v}" \
+            --notes "See the repository changelog and installation guide for this release."
+          assets=("$RUNNER_TEMP/release-assets/"*)
+          test "${#assets[@]}" -gt 0
+          gh release upload "$GITHUB_REF_NAME" "${assets[@]}"
       - name: Create and upload the complete updater manifest
         run: |
           mkdir -p "$RUNNER_TEMP/generated-manifest"

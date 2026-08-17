@@ -102,7 +102,7 @@ Tauri updater signatures are mandatory even when platform signing is unavailable
    Never use `--force` on an existing updater key without a separately reviewed rotation and recovery plan. Never commit the private key, and keep a verified encrypted backup outside the repository.
 2. Store the private key and optional password in GitHub secrets `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 3. Store the complete contents of `signer-keys/dsh-launcher-updater.key.pub` in the GitHub Actions variable `TAURI_UPDATER_PUBLIC_KEY`.
-4. Push `desktop-v<version>`. CI validates both values, verifies the pinned Node/npm transports, builds macOS arm64/x64 and Windows x64, signs updater artifacts, and creates a draft GitHub Release. A single final job assembles and verifies the three platform entries before uploading `latest.json`.
+4. Push `desktop-v<version>`. CI validates both values, verifies the pinned Node/npm transports, then builds and signs isolated macOS arm64/x64 and Windows x64 artifacts without publishing from matrix jobs. One final job stages versioned, architecture-specific names, creates a clean draft GitHub Release, uploads all assets serially, and verifies every installer, updater archive, signature, manifest entry, and exact website download URL before uploading `latest.json`.
 
 The draft is an intentional human release gate. Review the installers and `latest.json`, then publish the draft in GitHub. Until it is published, GitHub's `releases/latest/download/latest.json` endpoint does not expose it and installed clients cannot discover the update.
 

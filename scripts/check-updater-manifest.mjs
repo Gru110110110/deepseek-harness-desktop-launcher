@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { expectedReleaseAssetNames } from "./release-assets.mjs";
 
 const expectedPlatforms = ["darwin-aarch64", "darwin-x86_64", "windows-x86_64"];
 
@@ -84,6 +85,17 @@ export function validateUpdaterManifest(
   }
 }
 
+export function validateReleaseAssets(assetNames, { productName, version }) {
+  if (!(assetNames instanceof Set)) {
+    throw new Error("Release asset names are invalid");
+  }
+  for (const name of expectedReleaseAssetNames({ productName, version })) {
+    if (!assetNames.has(name)) {
+      throw new Error(`Release asset is missing: ${name}`);
+    }
+  }
+}
+
 async function main() {
   const [manifestPath, releaseAssetsPath] = process.argv.slice(2);
   if (!manifestPath) {
@@ -94,6 +106,12 @@ async function main() {
   const packageJson = JSON.parse(
     await readFile(new URL("../package.json", import.meta.url), "utf8"),
   );
+  const tauriConfig = JSON.parse(
+    await readFile(
+      new URL("../src-tauri/tauri.conf.json", import.meta.url),
+      "utf8",
+    ),
+  );
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   let assetNames;
   if (releaseAssetsPath) {
@@ -102,6 +120,10 @@ async function main() {
       throw new Error("Release assets response is invalid");
     }
     assetNames = new Set(release.assets.map((asset) => asset.name));
+    validateReleaseAssets(assetNames, {
+      productName: tauriConfig.productName,
+      version: packageJson.version,
+    });
   }
   validateUpdaterManifest(manifest, {
     expectedVersion: packageJson.version,

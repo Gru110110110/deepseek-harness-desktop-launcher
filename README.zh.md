@@ -102,7 +102,7 @@ pnpm tauri dev
    未经单独评审的轮换和恢复方案，不得对已有更新密钥使用 `--force`。私钥绝不能提交，并应在仓库外保留经过验证的加密备份。
 2. 将私钥和可选密码保存为 GitHub secrets：`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。
 3. 将 `signer-keys/dsh-launcher-updater.key.pub` 的完整内容保存为 GitHub Actions variable：`TAURI_UPDATER_PUBLIC_KEY`。
-4. 推送 `desktop-v<version>`。CI 会验证两端配置，核对固定 Node/npm 来源，构建 macOS arm64/x64 与 Windows x64，为更新产物签名，并创建 GitHub Release 草稿。最后由唯一一个 job 汇总并验证三个平台条目，再上传 `latest.json`。
+4. 推送 `desktop-v<version>`。CI 会验证两端配置，核对固定 Node/npm 来源，再分别构建并签名 macOS arm64/x64 与 Windows x64 隔离产物，矩阵 job 不直接发布。最后由唯一一个 job 生成包含版本和架构的规范资产名，串行创建干净的 GitHub Release 草稿并上传全部文件，然后逐项核对安装包、更新归档、签名、manifest 条目和官网精确下载链接，再上传 `latest.json`。
 
 草稿是有意保留的人工发布门禁。检查安装包与 `latest.json` 后，需要在 GitHub 中发布该草稿。在正式发布前，GitHub 的 `releases/latest/download/latest.json` 端点不会暴露它，已安装客户端也无法发现这次更新。
 

@@ -3,6 +3,11 @@ import { constants } from "node:fs";
 import { resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
+import {
+  RELEASE_PLATFORMS,
+  releaseAssetName,
+  releaseDownloadUrl,
+} from "./release-assets.mjs";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const publicRoot = resolve(root, "public");
@@ -188,6 +193,38 @@ for (const match of html.matchAll(/data-i18n(?:-html)?="([^"]+)"/gu)) {
 }
 
 const packageJson = JSON.parse(await read("package.json"));
+const releaseTag = `desktop-v${packageJson.version}`;
+const downloadCards = new Map();
+for (const match of html.matchAll(
+  /<a\b[^>]*\bdata-platform="([^"]+)"[^>]*>/gu,
+)) {
+  const href = match[0].match(/\bhref="([^"]+)"/u)?.[1];
+  if (!href || downloadCards.has(match[1])) {
+    throw new Error(`Website download card is invalid: ${match[1]}`);
+  }
+  downloadCards.set(match[1], href);
+}
+for (const platform of RELEASE_PLATFORMS) {
+  const filename = releaseAssetName({
+    productName: tauriConfig.productName,
+    version: packageJson.version,
+    platform,
+    ext: platform.installerExt,
+  });
+  const expectedUrl = releaseDownloadUrl(
+    "Gru110110110/deepseek-harness-desktop-launcher",
+    releaseTag,
+    filename,
+  );
+  if (downloadCards.get(platform.websitePlatform) !== expectedUrl) {
+    throw new Error(
+      `Website download URL mismatch for ${platform.websitePlatform}: expected ${expectedUrl}`,
+    );
+  }
+}
+if (downloadCards.size !== RELEASE_PLATFORMS.length) {
+  throw new Error("Website must expose exactly one download card per platform");
+}
 const advertisedVersions = [...main.matchAll(/\bv(\d+\.\d+\.\d+)\b/gu)].map(
   (match) => match[1],
 );

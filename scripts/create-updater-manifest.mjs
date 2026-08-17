@@ -1,24 +1,11 @@
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-
-const platforms = [
-  {
-    key: "darwin-aarch64",
-    artifact: "dsh-launcher-macos-arm64",
-    suffix: ".app.tar.gz",
-  },
-  {
-    key: "darwin-x86_64",
-    artifact: "dsh-launcher-macos-x64",
-    suffix: ".app.tar.gz",
-  },
-  {
-    key: "windows-x86_64",
-    artifact: "dsh-launcher-windows-x64",
-    suffix: ".exe",
-  },
-];
+import {
+  RELEASE_PLATFORMS,
+  releaseAssetName,
+  releaseDownloadUrl,
+} from "./release-assets.mjs";
 
 async function filesBelow(directory) {
   const files = [];
@@ -30,19 +17,12 @@ async function filesBelow(directory) {
   return files;
 }
 
-function releaseUrl(repository, tag, filename) {
-  const repositoryPath = repository
-    .split("/")
-    .map((part) => encodeURIComponent(part))
-    .join("/");
-  return `https://github.com/${repositoryPath}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(filename)}`;
-}
-
 export async function createUpdaterManifest({
   artifactRoot,
   repository,
   tag,
   version,
+  productName,
   pubDate = new Date().toISOString(),
   notes = "See the repository changelog and installation guide for this release.",
 }) {
@@ -53,15 +33,15 @@ export async function createUpdaterManifest({
 
   const entries = {};
   const releaseNames = new Set();
-  for (const platform of platforms) {
+  for (const platform of RELEASE_PLATFORMS) {
     const directory = resolve(artifactRoot, platform.artifact);
     const files = await filesBelow(directory);
     const candidates = files.filter(
-      (path) => path.endsWith(platform.suffix) && !path.endsWith(".sig"),
+      (path) => path.endsWith(platform.updaterExt) && !path.endsWith(".sig"),
     );
     if (candidates.length !== 1) {
       throw new Error(
-        `Expected exactly one ${platform.suffix} updater in ${platform.artifact}, found ${candidates.length}`,
+        `Expected exactly one ${platform.updaterExt} updater in ${platform.artifact}, found ${candidates.length}`,
       );
     }
     const updater = candidates[0];
@@ -73,14 +53,19 @@ export async function createUpdaterManifest({
     if (signature.length < 32) {
       throw new Error(`Invalid updater signature for ${basename(updater)}`);
     }
-    const name = basename(updater);
+    const name = releaseAssetName({
+      productName,
+      version,
+      platform,
+      ext: platform.updaterExt,
+    });
     if (releaseNames.has(name)) {
       throw new Error(`Duplicate release asset name: ${name}`);
     }
     releaseNames.add(name);
     entries[platform.key] = {
       signature,
-      url: releaseUrl(repository, tag, name),
+      url: releaseDownloadUrl(repository, tag, name),
     };
   }
 
@@ -99,6 +84,12 @@ async function main() {
   const packageJson = JSON.parse(
     await readFile(new URL("../package.json", import.meta.url), "utf8"),
   );
+  const tauriConfig = JSON.parse(
+    await readFile(
+      new URL("../src-tauri/tauri.conf.json", import.meta.url),
+      "utf8",
+    ),
+  );
   if (tag !== `desktop-v${packageJson.version}`) {
     throw new Error(
       `Release tag ${tag} does not match desktop-v${packageJson.version}`,
@@ -109,6 +100,7 @@ async function main() {
     repository,
     tag,
     version: packageJson.version,
+    productName: tauriConfig.productName,
   });
   await writeFile(destination, `${JSON.stringify(manifest, null, 2)}\n`, {
     mode: 0o600,
