@@ -70,6 +70,7 @@ export type MigrationState =
   | { kind: "pending"; plan: MigrationPlan }
   | { kind: "applying"; plan: MigrationPlan }
   | { kind: "completed" }
+  | { kind: "completedWithWarning"; warning: LauncherError }
   | { kind: "skipped" };
 
 export type LauncherSnapshot = {

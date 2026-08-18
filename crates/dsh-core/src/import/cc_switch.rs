@@ -73,9 +73,9 @@ pub fn import_cc_switch_configuration(
     }
     let (providers, skipped) = match read_providers(&database) {
         Ok(value) => value,
-        Err(_) => {
+        Err(error) => {
             complete(marker)?;
-            return Ok(outcome(false, "ccSwitchDatabaseUnreadable"));
+            return Err(error);
         }
     };
     let Some((settings_bytes, credential_bytes, additions)) = merge_documents(

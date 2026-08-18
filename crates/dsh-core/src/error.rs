@@ -8,7 +8,7 @@ pub type AppResult<T> = Result<T, AppError>;
 
 /// Stable, localizable error contract. Internal error chains are logged by the
 /// adapter and never exposed as UI translation keys.
-#[derive(Debug, Clone, Error, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Error, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[error("{code}: {safe_detail:?}")]
 #[serde(rename_all = "camelCase")]
 #[ts(rename = "LauncherError")]

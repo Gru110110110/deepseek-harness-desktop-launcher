@@ -5,7 +5,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -63,6 +63,7 @@ pub enum DeploymentEvent {
 #[derive(Debug, Clone, Default)]
 pub struct DeploymentController {
     cancelled: Arc<AtomicBool>,
+    cleanup_error: Arc<Mutex<Option<AppError>>>,
 }
 
 impl DeploymentController {
@@ -71,6 +72,18 @@ impl DeploymentController {
     }
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+    pub fn cleanup_error(&self) -> Option<AppError> {
+        self.cleanup_error
+            .lock()
+            .expect("deployment cleanup error poisoned")
+            .clone()
+    }
+    fn record_cleanup_error(&self, error: AppError) {
+        *self
+            .cleanup_error
+            .lock()
+            .expect("deployment cleanup error poisoned") = Some(error);
     }
     fn check(&self) -> AppResult<()> {
         if self.cancelled.load(Ordering::SeqCst) {
@@ -874,6 +887,7 @@ fn node_version(paths: &ApplicationPaths, node_dir: &Path) -> Option<String> {
     let mut command = Command::new(executable);
     command.arg("--version");
     isolated_command(&mut command, paths);
+    configure_process_group(&mut command);
     let output = command.output().ok()?;
     if !output.status.success() {
         return None;
@@ -894,6 +908,7 @@ fn dsh_valid(paths: &ApplicationPaths, node_dir: &Path, dsh_dir: &Path, version:
     let mut command = Command::new(node_executable(node_dir));
     command.arg(binary).arg("--version");
     isolated_command(&mut command, paths);
+    configure_process_group(&mut command);
     command.output().is_ok_and(|output| {
         output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == version
     })
@@ -933,13 +948,15 @@ fn run_logged(
         .stdin(Stdio::null());
     configure_process_group(command);
     let mut child = command.spawn()?;
+    #[cfg(windows)]
+    let job = WindowsProcessGuard::attach(&child)?;
     let deadline = Instant::now() + timeout;
     loop {
         if controller.check().is_err() || Instant::now() >= deadline {
-            terminate_tree(child.id(), false);
-            thread::sleep(Duration::from_secs(2));
-            terminate_tree(child.id(), true);
-            let _ = child.wait();
+            #[cfg(unix)]
+            stop_unix_command_tree(&mut child, controller)?;
+            #[cfg(windows)]
+            stop_windows_command_tree(&mut child, &job, controller)?;
             return Err(AppError::new(
                 if controller.cancelled.load(Ordering::SeqCst) {
                     "deploymentCancelled"
@@ -948,7 +965,13 @@ fn run_logged(
                 },
             ));
         }
+        #[cfg(windows)]
+        job.observe()?;
         if let Some(status) = child.try_wait()? {
+            #[cfg(unix)]
+            stop_unix_command_tree(&mut child, controller)?;
+            #[cfg(windows)]
+            stop_windows_command_tree(&mut child, &job, controller)?;
             return if status.success() {
                 Ok(())
             } else {
@@ -956,6 +979,62 @@ fn run_logged(
             };
         }
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(unix)]
+fn stop_unix_command_tree(
+    child: &mut std::process::Child,
+    controller: &DeploymentController,
+) -> AppResult<()> {
+    let pid = child.id();
+    if process_tree_alive(pid) {
+        terminate_tree(pid, false);
+    }
+    let graceful_deadline = Instant::now() + Duration::from_secs(2);
+    while process_tree_alive(pid) && Instant::now() < graceful_deadline {
+        let _ = child.try_wait();
+        thread::sleep(Duration::from_millis(50));
+    }
+    if process_tree_alive(pid) {
+        terminate_tree(pid, true);
+    }
+    let _ = child.wait();
+    let forced_deadline = Instant::now() + Duration::from_secs(5);
+    while process_tree_alive(pid) && Instant::now() < forced_deadline {
+        terminate_tree(pid, true);
+        thread::sleep(Duration::from_millis(50));
+    }
+    if process_tree_alive(pid) {
+        let error = AppError::new("serviceProcessTreeStillRunning").value("processId", pid);
+        controller.record_cleanup_error(error.clone());
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn stop_windows_command_tree(
+    child: &mut std::process::Child,
+    job: &WindowsProcessGuard,
+    controller: &DeploymentController,
+) -> AppResult<()> {
+    if let Err(error) = job.terminate() {
+        controller.record_cleanup_error(error.clone());
+        return Err(error);
+    }
+    let _ = child.wait();
+    match job.wait_until_empty(Duration::from_secs(5)) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            let error = AppError::new("serviceProcessTreeStillRunning");
+            controller.record_cleanup_error(error.clone());
+            Err(error)
+        }
+        Err(error) => {
+            controller.record_cleanup_error(error.clone());
+            Err(error)
+        }
     }
 }
 
@@ -1004,7 +1083,9 @@ pub(crate) fn configure_process_group(command: &mut Command) {
 #[cfg(windows)]
 pub(crate) fn configure_process_group(command: &mut Command) {
     use std::os::windows::process::CommandExt;
-    command.creation_flags(0x0000_0200 | 0x0800_0000);
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 }
 #[cfg(unix)]
 pub(crate) fn terminate_tree(pid: u32, force: bool) {
@@ -1015,11 +1096,344 @@ pub(crate) fn terminate_tree(pid: u32, force: bool) {
         );
     }
 }
+#[cfg(unix)]
+pub(crate) fn process_tree_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let result = unsafe { libc::kill(-pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
 #[cfg(windows)]
 pub(crate) fn terminate_tree(pid: u32, _force: bool) {
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .output();
+    let mut command = Command::new("taskkill");
+    command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+    configure_process_group(&mut command);
+    let _ = command.output();
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) enum WindowsProcessGuard {
+    Job(windows_sys::Win32::Foundation::HANDLE),
+    Snapshot {
+        processes: Mutex<std::collections::HashMap<u32, windows_sys::Win32::Foundation::HANDLE>>,
+    },
+}
+
+#[cfg(windows)]
+unsafe impl Send for WindowsProcessGuard {}
+
+#[cfg(windows)]
+impl WindowsProcessGuard {
+    pub(crate) fn attach(child: &std::process::Child) -> AppResult<Self> {
+        match Self::attach_job(child) {
+            Ok(handle) => Ok(Self::Job(handle)),
+            Err(job_error) => {
+                log::warn!(
+                    "Windows Job Object unavailable; using direct process-tree cleanup: {job_error}"
+                );
+                Self::attach_snapshot(child)
+            }
+        }
+    }
+
+    pub(crate) fn attach_snapshot(child: &std::process::Child) -> AppResult<Self> {
+        let root_handle = duplicate_process_handle(child)?;
+        Ok(Self::Snapshot {
+            processes: Mutex::new(std::iter::once((child.id(), root_handle)).collect()),
+        })
+    }
+
+    fn attach_job(
+        child: &std::process::Child,
+    ) -> std::io::Result<windows_sys::Win32::Foundation::HANDLE> {
+        use std::{mem::size_of, os::windows::io::AsRawHandle, ptr};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let job = WindowsOwnedHandle(handle);
+        let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle().cast()) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(job.into_raw())
+    }
+
+    pub(crate) fn observe(&self) -> AppResult<()> {
+        let Self::Snapshot { processes } = self else {
+            return Ok(());
+        };
+        let entries = windows_process_entries()
+            .map_err(|error| AppError::io("serviceProcessGuardFailed", &error))?;
+        let mut processes = processes.lock().expect("Windows process guard poisoned");
+        loop {
+            let mut changed = false;
+            for &(pid, parent_pid) in &entries {
+                if pid != 0 && processes.contains_key(&parent_pid) && !processes.contains_key(&pid)
+                {
+                    match open_process_handle(pid) {
+                        Ok(handle) => {
+                            processes.insert(pid, handle);
+                            changed = true;
+                        }
+                        Err(error) if error.raw_os_error() == Some(87) => {}
+                        Err(error) => {
+                            return Err(AppError::io("serviceProcessGuardFailed", &error));
+                        }
+                    }
+                }
+            }
+            if !changed {
+                return Ok(());
+            }
+        }
+    }
+
+    pub(crate) fn terminate(&self) -> AppResult<()> {
+        use windows_sys::Win32::System::{
+            JobObjects::TerminateJobObject, Threading::TerminateProcess,
+        };
+
+        match self {
+            Self::Job(handle) => {
+                if unsafe { TerminateJobObject(*handle, 1) } == 0 {
+                    return Err(AppError::io(
+                        "serviceProcessGuardFailed",
+                        &std::io::Error::last_os_error(),
+                    ));
+                }
+            }
+            Self::Snapshot { processes } => {
+                self.observe()?;
+                for handle in processes
+                    .lock()
+                    .expect("Windows process guard poisoned")
+                    .values()
+                {
+                    if process_handle_running(*handle)
+                        && unsafe { TerminateProcess(*handle, 1) } == 0
+                    {
+                        return Err(AppError::io(
+                            "serviceProcessGuardFailed",
+                            &std::io::Error::last_os_error(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn wait_until_empty(&self, timeout: Duration) -> AppResult<bool> {
+        use std::{mem::size_of, ptr};
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
+        };
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self {
+                Self::Job(handle) => {
+                    let mut information = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+                    if unsafe {
+                        QueryInformationJobObject(
+                            *handle,
+                            JobObjectBasicAccountingInformation,
+                            (&mut information as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)
+                                .cast(),
+                            size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                            ptr::null_mut(),
+                        )
+                    } == 0
+                    {
+                        return Err(AppError::io(
+                            "serviceProcessGuardFailed",
+                            &std::io::Error::last_os_error(),
+                        ));
+                    }
+                    if information.ActiveProcesses == 0 {
+                        return Ok(true);
+                    }
+                }
+                Self::Snapshot { processes } => {
+                    self.observe()?;
+                    self.terminate()?;
+                    if processes
+                        .lock()
+                        .expect("Windows process guard poisoned")
+                        .values()
+                        .all(|handle| !process_handle_running(*handle))
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsProcessGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::TerminateProcess};
+
+        match self {
+            Self::Job(handle) => unsafe {
+                CloseHandle(*handle);
+            },
+            Self::Snapshot { processes } => {
+                for handle in processes
+                    .get_mut()
+                    .expect("Windows process guard poisoned")
+                    .values()
+                {
+                    unsafe {
+                        if process_handle_running(*handle) {
+                            TerminateProcess(*handle, 1);
+                        }
+                        CloseHandle(*handle);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsOwnedHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl WindowsOwnedHandle {
+    fn into_raw(self) -> windows_sys::Win32::Foundation::HANDLE {
+        let handle = self.0;
+        std::mem::forget(self);
+        handle
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsOwnedHandle {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn duplicate_process_handle(
+    child: &std::process::Child,
+) -> AppResult<windows_sys::Win32::Foundation::HANDLE> {
+    use std::{os::windows::io::AsRawHandle, ptr};
+    use windows_sys::Win32::{
+        Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle},
+        System::Threading::GetCurrentProcess,
+    };
+
+    let current = unsafe { GetCurrentProcess() };
+    let mut duplicate = ptr::null_mut();
+    if unsafe {
+        DuplicateHandle(
+            current,
+            child.as_raw_handle().cast(),
+            current,
+            &mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        return Err(AppError::io(
+            "serviceProcessGuardFailed",
+            &std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(duplicate)
+}
+
+#[cfg(windows)]
+fn open_process_handle(pid: u32) -> std::io::Result<windows_sys::Win32::Foundation::HANDLE> {
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(handle)
+    }
+}
+
+#[cfg(windows)]
+fn process_handle_running(handle: windows_sys::Win32::Foundation::HANDLE) -> bool {
+    use windows_sys::Win32::{Foundation::WAIT_TIMEOUT, System::Threading::WaitForSingleObject};
+
+    unsafe { WaitForSingleObject(handle, 0) == WAIT_TIMEOUT }
+}
+
+#[cfg(windows)]
+fn windows_process_entries() -> std::io::Result<Vec<(u32, u32)>> {
+    use std::mem::size_of;
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        },
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    let snapshot = WindowsOwnedHandle(snapshot);
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut entries = Vec::new();
+    if unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0 {
+        loop {
+            entries.push((entry.th32ProcessID, entry.th32ParentProcessID));
+            if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
+                break;
+            }
+        }
+    }
+    Ok(entries)
 }
 
 fn acquire_lock(file: &File, controller: &DeploymentController) -> AppResult<()> {
@@ -1187,11 +1601,11 @@ fn activity<const N: usize>(
     });
 }
 
-fn fix_spawn_helper(dir: &Path) {
+fn fix_spawn_helper(_dir: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for entry in walkdir::WalkDir::new(dir.join("node_modules/node-pty/prebuilds"))
+        for entry in walkdir::WalkDir::new(_dir.join("node_modules/node-pty/prebuilds"))
             .into_iter()
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name() == "spawn-helper")

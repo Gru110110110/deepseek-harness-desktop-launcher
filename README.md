@@ -30,7 +30,7 @@ React feature registry + HashRouter
                   └─ pinned Node.js → published @deepseek-ai/dsh
 ```
 
-The feature registry owns routes and navigation metadata. Adding future pages means adding a feature descriptor and its backend module, not widening one global view. Business rules live in `dsh-core`, which has no Tauri dependency. Tauri owns only OS lifecycle, tray, clipboard, updater integration, and typed IPC. Commands and events are module-namespaced, and the frontend accepts only monotonically newer snapshot revisions.
+The feature registry owns routes and navigation metadata. Adding future pages means adding a feature descriptor and its backend module, not widening one global view. Business rules live in `dsh-core`, which has no Tauri dependency. Tauri owns only OS lifecycle, tray, clipboard, updater integration, and typed IPC. Commands and events are module-namespaced, and the frontend accepts only monotonically newer snapshot revisions. Windows builds use the GUI subsystem and start every helper process without a console window. When the system tray is available, closing the main window hides it and normal application exit is available from the tray menu. A tray initialization failure does not block startup; in that fallback mode, closing the main window performs a full cleanup and exits. Full exit is not released until deployment and local-service process trees have stopped and the loopback service port has closed. macOS groups launcher-owned descendants into a process group; Windows protects them with kill-on-close Job Objects.
 
 The project intentionally avoids a runtime plugin system, generalized workflow engine, or duplicate frontend/backend state machines. Those abstractions are not needed for the current launcher and would make future changes harder rather than easier.
 
@@ -55,7 +55,7 @@ The Rust application preserves the existing disk protocol:
 
 An explicit `DSH_HOME` disables all imports. Otherwise, the launcher only discovers compatible data in `DSH_DESKTOP_SOURCE_HOME` (default `~/.dsh`) and presents a choice before copying anything. Approval creates and verifies a private backup, performs a restore rehearsal, builds the complete result away from the active home, and publishes it with a crash-recoverable atomic transaction. Skipping is persisted and starts without importing into the existing isolated launcher home. Existing destination values and populated workspace ledgers always win.
 
-CC Switch remains an optional read-only source. The importer opens `cc-switch.db` read-only, accepts only standalone Claude providers with a literal credential, non-loopback HTTP(S) endpoint, supported protocol, and at least one model, and skips OAuth, managed, proxy-dependent, and ambiguous rows. Existing documents are conservatively extended only when their structure is understood. Credentials go only to `.credentials.yaml`, never settings or logs. Two-file publication is rolled back to the exact original bytes on failure.
+CC Switch remains an optional read-only source. The importer opens `cc-switch.db` read-only, accepts only standalone Claude providers with a literal credential, non-loopback HTTP(S) endpoint, supported protocol, and at least one model, and skips OAuth, managed, proxy-dependent, and ambiguous rows. Existing documents are conservatively extended only when their structure is understood. Credentials go only to `.credentials.yaml`, never settings or logs. Two-file publication is rolled back to the exact original bytes on failure. If Windows permissions or another local I/O problem prevents this optional import, the launcher reports that it was skipped and continues installing and starting Harness.
 
 Tests, checks, builds, and packaging must set temporary `DSH_DESKTOP_HOME`, `DSH_HOME`, `DSH_DESKTOP_SOURCE_HOME`, and `DSH_DESKTOP_CC_SWITCH_HOME`. They must never touch real user homes, Keychain, credential stores, or production data.
 
@@ -100,26 +100,25 @@ Tauri updater signatures are mandatory even when platform signing is unavailable
    ```
 
    Never use `--force` on an existing updater key without a separately reviewed rotation and recovery plan. Never commit the private key, and keep a verified encrypted backup outside the repository.
+
 2. Store the private key and optional password in GitHub secrets `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 3. Store the complete contents of `signer-keys/dsh-launcher-updater.key.pub` in the GitHub Actions variable `TAURI_UPDATER_PUBLIC_KEY`.
-4. Push `desktop-v<version>`. CI validates both values, verifies the pinned Node/npm transports, then builds and signs isolated macOS arm64/x64 and Windows x64 artifacts without publishing from matrix jobs. One final job stages versioned, architecture-specific names, creates a clean draft GitHub Release, uploads all assets serially, and verifies every installer, updater archive, signature, manifest entry, and exact website download URL before uploading `latest.json`.
-
-The draft is an intentional human release gate. Review the installers and `latest.json`, then publish the draft in GitHub. Until it is published, GitHub's `releases/latest/download/latest.json` endpoint does not expose it and installed clients cannot discover the update.
+4. Push `desktop-v<version>`. CI validates both values, verifies the pinned Node/npm transports, then builds and signs isolated macOS arm64/x64 and Windows x64 artifacts without publishing from matrix jobs. One final job stages versioned, architecture-specific names, creates a clean draft GitHub Release, uploads all assets serially, verifies every installer, updater archive, signature, manifest entry, and exact website download URL, and only then publishes the verified release. A failed or incomplete build remains unpublished, so `releases/latest/download/latest.json` and installed clients never observe a partial release.
 
 The checked-in updater public key is intentionally empty: local source builds do not belong to a production update channel. Release CI validates the configured minisign public key, writes a temporary release-only Tauri config, and passes it explicitly to the CLI with `--config`; a release cannot build without both sides of the updater trust chain. In the absence of a Developer ID, macOS bundles receive a complete ad-hoc signature and both local packaging and CI reject bundles that fail strict `codesign` verification. Ad-hoc signing does not provide Apple notarization: a browser-downloaded build may still require the user to approve its first launch in macOS Privacy & Security. A warning-free first launch on arbitrary Macs requires a Developer ID Application certificate and notarization. Windows Authenticode remains optional independent hardening and does not weaken the mandatory Tauri update signature.
 
 ## Runtime environment overrides
 
-| Variable | Meaning |
-| --- | --- |
-| `DSH_DESKTOP_HOME` | Launcher/runtime home; defaults to `~/.dsh-desktop` |
-| `DSH_HOME` | Explicit external Harness home; bypasses the isolated desktop `dsh-home` and disables all imports. Set it only deliberately. |
-| `DSH_DESKTOP_SOURCE_HOME` | Optional source-home import; defaults to `~/.dsh` |
-| `DSH_DESKTOP_CC_SWITCH_HOME` | Optional read-only CC Switch source; defaults to `~/.cc-switch` |
-| `DSH_DESKTOP_NODE_VERSION` | Exact Node override; requires `DSH_DESKTOP_NODE_SHA256` |
-| `DSH_DESKTOP_NODE_SHA256` | SHA-256 trust root for an overridden Node archive |
-| `DSH_DESKTOP_NODE_BASES` | Comma-separated Node mirrors; explicit values suppress defaults |
-| `DSH_DESKTOP_NPM_REGISTRIES` | Comma-separated npm registries; explicit values suppress defaults |
+| Variable                     | Meaning                                                                                                                      |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `DSH_DESKTOP_HOME`           | Launcher/runtime home; defaults to `~/.dsh-desktop`                                                                          |
+| `DSH_HOME`                   | Explicit external Harness home; bypasses the isolated desktop `dsh-home` and disables all imports. Set it only deliberately. |
+| `DSH_DESKTOP_SOURCE_HOME`    | Optional source-home import; defaults to `~/.dsh`                                                                            |
+| `DSH_DESKTOP_CC_SWITCH_HOME` | Optional read-only CC Switch source; defaults to `~/.cc-switch`                                                              |
+| `DSH_DESKTOP_NODE_VERSION`   | Exact Node override; requires `DSH_DESKTOP_NODE_SHA256`                                                                      |
+| `DSH_DESKTOP_NODE_SHA256`    | SHA-256 trust root for an overridden Node archive                                                                            |
+| `DSH_DESKTOP_NODE_BASES`     | Comma-separated Node mirrors; explicit values suppress defaults                                                              |
+| `DSH_DESKTOP_NPM_REGISTRIES` | Comma-separated npm registries; explicit values suppress defaults                                                            |
 
 ## License
 

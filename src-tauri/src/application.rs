@@ -46,6 +46,7 @@ pub(crate) struct AppState {
     desktop_update_busy: AtomicBool,
     startup_thread: Mutex<Option<thread::JoinHandle<()>>>,
     quitting: AtomicBool,
+    exit_ready: AtomicBool,
     tray: Mutex<Option<TrayIcon>>,
 }
 
@@ -76,6 +77,7 @@ impl AppState {
             desktop_update_busy: AtomicBool::new(false),
             startup_thread: Mutex::new(None),
             quitting: AtomicBool::new(false),
+            exit_ready: AtomicBool::new(false),
             tray: Mutex::new(None),
         }))
     }
@@ -165,10 +167,32 @@ impl AppState {
                     snapshot.progress = ProgressState::Indeterminate;
                 });
                 match self.migration.apply() {
-                    Ok(_) => self.mutate(|snapshot| snapshot.migration = MigrationState::Completed),
+                    Ok(outcome) => {
+                        if let Some(warning) = outcome.warning {
+                            log::warn!("optional CC Switch import was skipped: {warning}");
+                            self.mutate(|snapshot| {
+                                snapshot.migration =
+                                    MigrationState::CompletedWithWarning { warning }
+                            });
+                        } else {
+                            self.mutate(|snapshot| snapshot.migration = MigrationState::Completed);
+                        }
+                    }
                     Err(error) => {
-                        self.fail_unless_quitting(error);
-                        return;
+                        log::warn!("local data import failed and will be skipped: {error:?}");
+                        if let Err(skip_error) = self.migration.skip() {
+                            log::error!(
+                                "the failed import could not be safely recovered and skipped: {skip_error:?}"
+                            );
+                            self.fail_unless_quitting(skip_error);
+                            return;
+                        }
+                        let detail = error.safe_detail.unwrap_or(error.code);
+                        self.mutate(|snapshot| {
+                            snapshot.migration = MigrationState::CompletedWithWarning {
+                                warning: AppError::new("migrationImportSkipped").detail(detail),
+                            }
+                        });
                     }
                 }
             } else {
@@ -193,8 +217,9 @@ impl AppState {
         if self.quitting.load(Ordering::SeqCst) {
             return;
         }
-        if force {
-            self.server.lock().expect("server poisoned").stop();
+        if force && let Err(error) = self.server.lock().expect("server poisoned").stop() {
+            self.fail_unless_quitting(error);
+            return;
         }
         let weak = Arc::downgrade(self);
         let deployed = deploy_runtime(
@@ -286,7 +311,7 @@ impl AppState {
     }
 
     fn fail(&self, error: AppError) {
-        log::error!("launcher operation failed: {error}");
+        log::error!("launcher operation failed: {error:?}");
         self.mutate(|snapshot| {
             snapshot.phase = LauncherPhase::Failed;
             snapshot.error = Some(error);
@@ -461,7 +486,9 @@ impl AppState {
                 // Tauri's Windows updater starts the installer and then calls
                 // process::exit(0). Cleanup after Update::install is therefore
                 // unreachable on Windows and must live in this hook.
-                state.prepare_restart();
+                if let Err(error) = state.prepare_restart() {
+                    log::error!("service cleanup before updater exit failed: {error:?}");
+                }
             })
             .build()
             .map_err(|error| AppError::new("desktopUpdateFailed").detail(error.to_string()))
@@ -633,51 +660,91 @@ impl AppState {
 
         // On Windows Update::install exits the process after invoking the
         // on_before_exit hook, so this branch is reached only on macOS/Linux.
-        self.prepare_restart();
+        self.prepare_restart()?;
         self.app.restart();
     }
-    pub(crate) fn prepare_restart(self: &Arc<Self>) {
+    pub(crate) fn prepare_restart(self: &Arc<Self>) -> AppResult<()> {
         self.quitting.store(true, Ordering::SeqCst);
-        self.cancel_deployment();
-        self.join_startup();
-        self.server.lock().expect("server poisoned").stop();
-        // Windows updater exits with process::exit, so normal Drop cleanup is
-        // skipped. Explicitly dropping the tray icon prevents a stale icon
-        // from surviving until Explorer receives another mouse event.
-        let tray = self.tray.lock().expect("tray poisoned").take();
-        drop(tray);
+        let deployment = self.cancel_deployment();
+        let stopped = self.complete_process_cleanup(deployment);
+        match stopped {
+            Ok(()) => {
+                self.hide_tray_before_exit();
+                self.exit_ready.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(error) => {
+                self.quitting.store(false, Ordering::SeqCst);
+                Err(error)
+            }
+        }
     }
     pub(crate) fn quit(self: &Arc<Self>) {
         if self.quitting.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.cancel_deployment();
+        let deployment = self.cancel_deployment();
         self.mutate(|snapshot| snapshot.phase = LauncherPhase::Stopping);
         let state = Arc::clone(self);
         if let Err(error) = thread::Builder::new()
             .name("launcher-shutdown".into())
-            .spawn(move || {
-                state.join_startup();
-                state.server.lock().expect("server poisoned").stop();
-                state.app.exit(0);
+            .spawn(move || match state.complete_process_cleanup(deployment) {
+                Ok(()) => state.exit_after_cleanup(),
+                Err(error) => state.shutdown_failed(error),
             })
         {
             log::error!("shutdown worker could not start: {error}");
-            self.join_startup();
-            self.server.lock().expect("server poisoned").stop();
-            self.app.exit(0);
+            let deployment = self.cancel_deployment();
+            match self.complete_process_cleanup(deployment) {
+                Ok(()) => self.exit_after_cleanup(),
+                Err(error) => self.shutdown_failed(error),
+            }
         }
     }
 
-    fn cancel_deployment(&self) {
-        if let Some(controller) = self
+    fn shutdown_failed(&self, error: AppError) {
+        log::error!("service cleanup failed; application exit was cancelled: {error:?}");
+        self.exit_ready.store(false, Ordering::SeqCst);
+        self.quitting.store(false, Ordering::SeqCst);
+        self.fail(error);
+        show_main_window(&self.app);
+    }
+
+    fn exit_after_cleanup(&self) {
+        self.hide_tray_before_exit();
+        self.exit_ready.store(true, Ordering::SeqCst);
+        self.app.exit(0);
+    }
+
+    fn hide_tray_before_exit(&self) {
+        if let Some(tray) = self.tray.lock().expect("tray poisoned").as_ref()
+            && let Err(error) = tray.set_visible(false)
+        {
+            log::warn!("system tray icon could not be removed before exit: {error}");
+        }
+    }
+
+    fn cancel_deployment(&self) -> Option<DeploymentController> {
+        let controller = self
             .deployment
             .lock()
             .expect("deployment poisoned")
             .as_ref()
-        {
+            .cloned();
+        if let Some(controller) = controller.as_ref() {
             controller.cancel();
         }
+        controller
+    }
+
+    fn complete_process_cleanup(&self, deployment: Option<DeploymentController>) -> AppResult<()> {
+        self.join_startup();
+        let deployment_error = deployment.and_then(|controller| controller.cleanup_error());
+        self.server.lock().expect("server poisoned").stop()?;
+        if let Some(error) = deployment_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn join_startup(&self) {
@@ -770,6 +837,23 @@ async fn check_desktop_update_after_startup(state: Arc<AppState>) {
     let _ = state.check_desktop_update(false).await;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleDecision {
+    KeepRunning,
+    QuitAfterCleanup,
+    AllowExit,
+}
+
+fn lifecycle_decision(exit_ready: bool, tray_available: bool) -> LifecycleDecision {
+    if exit_ready {
+        LifecycleDecision::AllowExit
+    } else if tray_available {
+        LifecycleDecision::KeepRunning
+    } else {
+        LifecycleDecision::QuitAfterCleanup
+    }
+}
+
 pub fn run() {
     if handle_cli_probe() {
         return;
@@ -788,7 +872,7 @@ pub fn run() {
             let state =
                 AppState::new(app.handle().clone(), paths).map_err(|error| error.to_string())?;
             if let Err(error) = install_tray(app, &state) {
-                log::warn!("system tray unavailable: {error}");
+                log::warn!("system tray unavailable; closing the window will exit: {error}");
             }
             app.manage(Arc::clone(&state));
             state.start(false, None);
@@ -798,14 +882,22 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event
                 && let Some(state) = window.app_handle().try_state::<Arc<AppState>>()
-                && !state.quitting.load(Ordering::SeqCst)
             {
-                if state.snapshot().tray_available {
-                    api.prevent_close();
-                    let _ = window.hide();
-                } else {
-                    api.prevent_close();
-                    state.quit();
+                match lifecycle_decision(
+                    state.exit_ready.load(Ordering::SeqCst),
+                    state.snapshot().tray_available,
+                ) {
+                    LifecycleDecision::KeepRunning => {
+                        api.prevent_close();
+                        if let Err(error) = window.hide() {
+                            log::warn!("main window could not be hidden: {error}");
+                        }
+                    }
+                    LifecycleDecision::QuitAfterCleanup => {
+                        api.prevent_close();
+                        state.quit();
+                    }
+                    LifecycleDecision::AllowExit => {}
                 }
             }
         })
@@ -823,7 +915,6 @@ pub fn run() {
             commands::preferences_set_theme,
             commands::application_check_update,
             commands::application_install_update,
-            commands::application_quit,
         ])
         .build(tauri::generate_context!())
         .expect("error while building DSH Launcher")
@@ -838,11 +929,18 @@ pub fn run() {
                 }
             }
             RunEvent::ExitRequested { api, .. } => {
-                if let Some(state) = app.try_state::<Arc<AppState>>()
-                    && !state.quitting.load(Ordering::SeqCst)
-                {
-                    api.prevent_exit();
-                    state.quit();
+                if let Some(state) = app.try_state::<Arc<AppState>>() {
+                    match lifecycle_decision(
+                        state.exit_ready.load(Ordering::SeqCst),
+                        state.snapshot().tray_available,
+                    ) {
+                        LifecycleDecision::KeepRunning => api.prevent_exit(),
+                        LifecycleDecision::QuitAfterCleanup => {
+                            api.prevent_exit();
+                            state.quit();
+                        }
+                        LifecycleDecision::AllowExit => {}
+                    }
                 }
             }
             _ => {}
@@ -883,10 +981,47 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::WEBSITE;
+    use super::{LifecycleDecision, WEBSITE, lifecycle_decision};
 
     #[test]
     fn product_website_uses_the_public_homepage() {
         assert_eq!(WEBSITE, "https://dsdesktop.com/");
+    }
+
+    #[test]
+    fn closing_or_requesting_exit_keeps_the_tray_process_running() {
+        assert_eq!(
+            lifecycle_decision(false, true),
+            LifecycleDecision::KeepRunning
+        );
+    }
+
+    #[test]
+    fn closing_without_a_tray_quits_after_cleanup() {
+        assert_eq!(
+            lifecycle_decision(false, false),
+            LifecycleDecision::QuitAfterCleanup
+        );
+    }
+
+    #[test]
+    fn cleanup_in_progress_does_not_allow_the_process_to_exit() {
+        assert_eq!(
+            lifecycle_decision(false, true),
+            LifecycleDecision::KeepRunning
+        );
+        assert_eq!(
+            lifecycle_decision(false, false),
+            LifecycleDecision::QuitAfterCleanup
+        );
+    }
+
+    #[test]
+    fn completed_cleanup_allows_the_process_to_exit() {
+        assert_eq!(lifecycle_decision(true, true), LifecycleDecision::AllowExit);
+        assert_eq!(
+            lifecycle_decision(true, false),
+            LifecycleDecision::AllowExit
+        );
     }
 }

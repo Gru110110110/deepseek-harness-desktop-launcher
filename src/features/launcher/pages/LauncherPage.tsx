@@ -38,6 +38,12 @@ export function LauncherPage() {
   const migrationPlan =
     snapshot.migration.kind === "pending" ? snapshot.migration.plan : null;
   const awaitingMigration = migrationPlan !== null;
+  const migrationWarning = useMemo(() => {
+    if (snapshot.migration.kind !== "completedWithWarning") return null;
+    return presentError(snapshot.migration.warning, (key, values) =>
+      t(key, values),
+    );
+  }, [snapshot.migration, t]);
   const elapsed = snapshot.serviceStartedAtMs
     ? formatDuration(now - snapshot.serviceStartedAtMs)
     : null;
@@ -247,6 +253,12 @@ export function LauncherPage() {
               {t(updateNotice.actionLabel ?? "action.updateHarness")}
             </button>
           )}
+        </div>
+      )}
+
+      {migrationWarning && (
+        <div className="update-banner error" role="alert">
+          <span>{migrationWarning}</span>
         </div>
       )}
 

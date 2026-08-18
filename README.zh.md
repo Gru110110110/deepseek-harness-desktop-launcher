@@ -30,7 +30,7 @@ React 功能注册表 + HashRouter
                   └─ 固定 Node.js → 已发布 @deepseek-ai/dsh
 ```
 
-功能注册表统一拥有路由和导航元数据。后续增加页面时只需增加 feature descriptor 和对应后端模块，不必继续扩大单个全局 View。业务规则全部位于不依赖 Tauri 的 `dsh-core`；Tauri 只负责操作系统生命周期、托盘、剪贴板、更新器和类型化 IPC。命令与事件按模块命名，前端只接受 revision 单调递增的新状态。
+功能注册表统一拥有路由和导航元数据。后续增加页面时只需增加 feature descriptor 和对应后端模块，不必继续扩大单个全局 View。业务规则全部位于不依赖 Tauri 的 `dsh-core`；Tauri 只负责操作系统生命周期、托盘、剪贴板、更新器和类型化 IPC。命令与事件按模块命名，前端只接受 revision 单调递增的新状态。Windows 构建使用 GUI 子系统，所有辅助进程均以无控制台窗口方式启动。系统托盘可用时，关闭主窗口只会隐藏界面，正常退出通过托盘菜单完成。托盘初始化失败不会阻塞启动；在这一降级模式下，关闭主窗口会完成清理并彻底退出。部署进程树与本地服务进程树均已停止、回环服务端口也已关闭后，才会放行彻底退出。macOS 使用进程组管理启动器拥有的后代进程，Windows 使用关闭时终止全部成员的 Job Object 保护它们。
 
 项目有意不引入运行时插件系统、通用工作流引擎或前后端重复状态机。这些抽象对当前启动器没有收益，只会增加未来修改成本。
 
@@ -55,7 +55,7 @@ Rust 应用保持原有磁盘协议：
 
 显式 `DSH_HOME` 会关闭所有导入。否则启动器只会在 `DSH_DESKTOP_SOURCE_HOME`（默认 `~/.dsh`）中发现兼容数据，并在复制任何内容前要求用户选择。确认导入后会创建并校验私有备份、完成恢复演练、在活动目录之外构建完整结果，再通过可从崩溃恢复的原子事务发布；选择跳过会被持久化，并在不导入来源数据的情况下使用现有隔离启动器目录启动。已有目标值和已填充的 workspace ledger 始终优先。
 
-CC Switch 只是可选的只读来源。导入器以只读方式打开 `cc-switch.db`，只接受具有字面凭据、非回环 HTTP(S) 地址、受支持协议且至少包含一个模型的独立 Claude provider；OAuth、托管账号、依赖代理和含义不明确的记录全部跳过。只有在能可靠理解既有文档结构时才补充缺失值。凭据只进入 `.credentials.yaml`，永不进入 settings 或日志。双文件发布失败时会恢复为完全一致的原始字节。
+CC Switch 只是可选的只读来源。导入器以只读方式打开 `cc-switch.db`，只接受具有字面凭据、非回环 HTTP(S) 地址、受支持协议且至少包含一个模型的独立 Claude provider；OAuth、托管账号、依赖代理和含义不明确的记录全部跳过。只有在能可靠理解既有文档结构时才补充缺失值。凭据只进入 `.credentials.yaml`，永不进入 settings 或日志。双文件发布失败时会恢复为完全一致的原始字节。如果 Windows 权限或其他本地 I/O 问题导致这项可选导入失败，启动器会提示已跳过，并继续安装和启动 Harness。
 
 测试、检查、构建和打包必须设置临时的 `DSH_DESKTOP_HOME`、`DSH_HOME`、`DSH_DESKTOP_SOURCE_HOME` 与 `DSH_DESKTOP_CC_SWITCH_HOME`。不得接触真实用户目录、Keychain、凭据存储或生产数据。
 
@@ -100,26 +100,25 @@ pnpm tauri dev
    ```
 
    未经单独评审的轮换和恢复方案，不得对已有更新密钥使用 `--force`。私钥绝不能提交，并应在仓库外保留经过验证的加密备份。
+
 2. 将私钥和可选密码保存为 GitHub secrets：`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。
 3. 将 `signer-keys/dsh-launcher-updater.key.pub` 的完整内容保存为 GitHub Actions variable：`TAURI_UPDATER_PUBLIC_KEY`。
-4. 推送 `desktop-v<version>`。CI 会验证两端配置，核对固定 Node/npm 来源，再分别构建并签名 macOS arm64/x64 与 Windows x64 隔离产物，矩阵 job 不直接发布。最后由唯一一个 job 生成包含版本和架构的规范资产名，串行创建干净的 GitHub Release 草稿并上传全部文件，然后逐项核对安装包、更新归档、签名、manifest 条目和官网精确下载链接，再上传 `latest.json`。
-
-草稿是有意保留的人工发布门禁。检查安装包与 `latest.json` 后，需要在 GitHub 中发布该草稿。在正式发布前，GitHub 的 `releases/latest/download/latest.json` 端点不会暴露它，已安装客户端也无法发现这次更新。
+4. 推送 `desktop-v<version>`。CI 会验证两端配置，核对固定 Node/npm 来源，再分别构建并签名 macOS arm64/x64 与 Windows x64 隔离产物，矩阵 job 不直接发布。最后由唯一一个 job 生成包含版本和架构的规范资产名，串行创建干净的 GitHub Release 草稿并上传全部文件，逐项核对安装包、更新归档、签名、manifest 条目和官网精确下载链接，全部通过后才正式发布。构建失败或产物不完整时 Release 会保持未发布状态，因此 `releases/latest/download/latest.json` 与已安装客户端不会看到残缺版本。
 
 仓库配置中的 updater 公钥有意留空：本地源码构建不属于生产更新频道。发布 CI 会校验 minisign 公钥格式、写入仅用于本次发布的临时 Tauri 配置，并通过 `--config` 显式交给 CLI；更新信任链任一端缺失都会阻止发布。没有 Developer ID 时，macOS App 会获得完整的 ad-hoc 签名，本地打包与 CI 都会用严格的 `codesign` 校验阻止签名不完整的产物。ad-hoc 签名不等于 Apple 公证：浏览器下载的版本首次启动时仍可能需要用户在 macOS「隐私与安全性」中确认放行；要让任意 Mac 首次启动都不出现身份提示，必须使用 Developer ID Application 证书并完成公证。Windows Authenticode 仍是独立的可选加固，不会降低 Tauri 更新签名的强制要求。
 
 ## 运行环境变量
 
-| 变量 | 含义 |
-| --- | --- |
-| `DSH_DESKTOP_HOME` | 启动器/运行环境目录，默认 `~/.dsh-desktop` |
-| `DSH_HOME` | 显式外部 Harness 目录；会绕过桌面端隔离的 `dsh-home` 并关闭全部导入，只应有意设置 |
-| `DSH_DESKTOP_SOURCE_HOME` | 可选的 source home，默认 `~/.dsh` |
-| `DSH_DESKTOP_CC_SWITCH_HOME` | 可选的只读 CC Switch 来源，默认 `~/.cc-switch` |
-| `DSH_DESKTOP_NODE_VERSION` | 精确 Node 覆盖值；必须同时设置 `DSH_DESKTOP_NODE_SHA256` |
-| `DSH_DESKTOP_NODE_SHA256` | 自定义 Node 归档的 SHA-256 信任根 |
-| `DSH_DESKTOP_NODE_BASES` | 逗号分隔的 Node 镜像；显式配置会关闭默认回退 |
-| `DSH_DESKTOP_NPM_REGISTRIES` | 逗号分隔的 npm registry；显式配置会关闭默认回退 |
+| 变量                         | 含义                                                                              |
+| ---------------------------- | --------------------------------------------------------------------------------- |
+| `DSH_DESKTOP_HOME`           | 启动器/运行环境目录，默认 `~/.dsh-desktop`                                        |
+| `DSH_HOME`                   | 显式外部 Harness 目录；会绕过桌面端隔离的 `dsh-home` 并关闭全部导入，只应有意设置 |
+| `DSH_DESKTOP_SOURCE_HOME`    | 可选的 source home，默认 `~/.dsh`                                                 |
+| `DSH_DESKTOP_CC_SWITCH_HOME` | 可选的只读 CC Switch 来源，默认 `~/.cc-switch`                                    |
+| `DSH_DESKTOP_NODE_VERSION`   | 精确 Node 覆盖值；必须同时设置 `DSH_DESKTOP_NODE_SHA256`                          |
+| `DSH_DESKTOP_NODE_SHA256`    | 自定义 Node 归档的 SHA-256 信任根                                                 |
+| `DSH_DESKTOP_NODE_BASES`     | 逗号分隔的 Node 镜像；显式配置会关闭默认回退                                      |
+| `DSH_DESKTOP_NPM_REGISTRIES` | 逗号分隔的 npm registry；显式配置会关闭默认回退                                   |
 
 ## 许可
 

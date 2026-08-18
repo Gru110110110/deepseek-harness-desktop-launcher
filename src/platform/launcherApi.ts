@@ -28,7 +28,6 @@ export const launcherApi = {
     action("preferences_set_theme", { theme }),
   checkDesktopUpdate: () => command<string | null>("application_check_update"),
   installDesktopUpdate: () => action("application_install_update"),
-  quit: () => action("application_quit"),
   onState: (
     handler: (snapshot: LauncherSnapshot) => void,
   ): Promise<UnlistenFn> =>

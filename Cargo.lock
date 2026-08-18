@@ -783,12 +783,13 @@ dependencies = [
 
 [[package]]
 name = "dsh-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "flate2",
  "fs2",
  "hex",
  "libc",
+ "log",
  "regex",
  "reqwest 0.12.28",
  "rusqlite",
@@ -804,12 +805,13 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+ "windows-sys 0.61.2",
  "zip 5.1.1",
 ]
 
 [[package]]
 name = "dsh-launcher"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dsh-core",
  "log",

@@ -1,11 +1,13 @@
+#[cfg(target_os = "macos")]
+use std::path::Path;
+#[cfg(windows)]
+use std::process::Stdio;
 #[cfg(unix)]
 use std::thread;
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{collections::HashSet, path::PathBuf, process::Command};
 
+#[cfg(windows)]
+use crate::runtime::configure_process_group;
 use crate::{AppError, AppResult, model::BrowserChoice};
 
 #[derive(Debug, Clone)]
@@ -69,11 +71,20 @@ impl BrowserCatalog {
 }
 
 fn spawn(command: &mut Command) -> AppResult<()> {
-    let mut child = command
+    #[cfg(windows)]
+    {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_group(command);
+    }
+    let child = command
         .spawn()
         .map_err(|error| AppError::io("browserOpenFailed", &error))?;
     #[cfg(unix)]
     thread::spawn(move || {
+        let mut child = child;
         let _ = child.wait();
     });
     #[cfg(not(unix))]

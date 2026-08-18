@@ -15,7 +15,7 @@ tauri-build = { version = "2.4", features = [] }
 
 [dependencies]
 dsh-core = { path = "../crates/dsh-core" }
-log = "0.4"
+log.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

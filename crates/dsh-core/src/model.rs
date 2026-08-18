@@ -68,6 +68,9 @@ pub enum MigrationState {
         plan: MigrationPlan,
     },
     Completed,
+    CompletedWithWarning {
+        warning: AppError,
+    },
     Skipped,
 }
 

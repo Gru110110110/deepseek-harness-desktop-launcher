@@ -5,6 +5,10 @@ on:
   push:
     tags: ["desktop-v*"]
 
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
@@ -34,6 +38,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
+      - name: Restore Rust validation cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: validate-${{ runner.arch }}
+          cache-on-failure: true
       - run: pnpm install --frozen-lockfile
       - name: Verify release version and generated contract
         run: |
@@ -109,7 +118,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: ${{ matrix.target }}
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: build-${{ matrix.target }}
+          cache-on-failure: true
       - run: pnpm install --frozen-lockfile
+      - name: Verify Windows process-tree cleanup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $output = @(& cargo test -p dsh-core --lib --target ${{ matrix.target }} `
+            service::tests::windows_process_guard_closes_descendants_and_releases_their_port `
+            -- --exact 2>&1)
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($exitCode -ne 0) {
+            $detail = (($output | Select-Object -Last 80) -join "`n") `
+              -replace '%', '%25' `
+              -replace "`r", '%0D' `
+              -replace "`n", '%0A'
+            Write-Host "::error title=Windows process-tree cleanup test failed::$detail"
+            exit $exitCode
+          }
       - name: Require the Tauri updater trust root
         shell: bash
         run: |
@@ -121,6 +152,18 @@ jobs:
         with:
           retryAttempts: 3
           args: --config "${{ runner.temp }}/tauri.release.json" --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+      - name: Require the Windows GUI subsystem
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $executable = "target/${{ matrix.target }}/release/dsh-launcher.exe"
+          $bytes = [System.IO.File]::ReadAllBytes($executable)
+          $peHeader = [System.BitConverter]::ToInt32($bytes, 0x3c)
+          $optionalHeader = $peHeader + 24
+          $subsystem = [System.BitConverter]::ToUInt16($bytes, $optionalHeader + 68)
+          if ($subsystem -ne 2) {
+            throw "Expected Windows GUI subsystem (2), found $subsystem"
+          }
       - name: Require signed updater artifacts
         shell: bash
         run: |
@@ -304,3 +347,5 @@ jobs:
           gh release download "$GITHUB_REF_NAME" --pattern latest.json --dir "$RUNNER_TEMP/updater-manifest"
           gh release view "$GITHUB_REF_NAME" --json assets > "$RUNNER_TEMP/updater-manifest/release-assets.json"
           node scripts/check-updater-manifest.mjs "$RUNNER_TEMP/updater-manifest/latest.json" "$RUNNER_TEMP/updater-manifest/release-assets.json"
+      - name: Publish the verified release
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

@@ -30,6 +30,12 @@ pub struct MigrationService {
     cc_switch_home: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MigrationOutcome {
+    pub plan: MigrationPlan,
+    pub warning: Option<AppError>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ManifestKind {
     Directory,
@@ -130,7 +136,18 @@ impl MigrationService {
         Ok(())
     }
 
-    pub fn apply(&self) -> AppResult<MigrationPlan> {
+    pub fn apply(&self) -> AppResult<MigrationOutcome> {
+        self.apply_with(import_cc_switch_configuration)
+    }
+
+    fn apply_with(
+        &self,
+        import_cc_switch: impl FnOnce(
+            &Path,
+            &Path,
+            &Path,
+        ) -> AppResult<crate::import::CcSwitchImportResult>,
+    ) -> AppResult<MigrationOutcome> {
         let _lock = self.lock()?;
         self.recover_locked()?;
         let plan = self
@@ -193,20 +210,51 @@ impl MigrationService {
         clone_directory(&backup, &candidate)?;
         fs::create_dir(&markers)?;
         owner_only(&markers)?;
-        let applied = (|| -> AppResult<()> {
+        let applied = (|| -> AppResult<Option<AppError>> {
             import_source_home(source, &candidate, &markers.join("source-home"))?;
             import_source_workspace(source, &candidate, &markers.join("workspace"))?;
-            import_cc_switch_configuration(cc_switch, &candidate, &markers.join("cc-switch"))?;
+            let before_cc_switch = manifest(&candidate)?;
+            let readonly_targets = make_cc_switch_targets_writable(&candidate)?;
+            let warning = match import_cc_switch(cc_switch, &candidate, &markers.join("cc-switch"))
+            {
+                Ok(result) => {
+                    if !result.imported {
+                        restore_readonly(&readonly_targets)?;
+                    }
+                    None
+                }
+                Err(error) => {
+                    // CC Switch is an optional source. Its importer rolls back
+                    // both output files on failure. Verify that rollback before
+                    // allowing the candidate to proceed; rebuild only if the
+                    // candidate differs so partial data can never be published.
+                    restore_readonly(&readonly_targets)?;
+                    if manifest(&candidate)? != before_cc_switch {
+                        remove_owned(&candidate)?;
+                        remove_owned(&markers)?;
+                        clone_directory(&backup, &candidate)?;
+                        fs::create_dir(&markers)?;
+                        owner_only(&markers)?;
+                        import_source_home(source, &candidate, &markers.join("source-home"))?;
+                        import_source_workspace(source, &candidate, &markers.join("workspace"))?;
+                    }
+                    let detail = error.safe_detail.unwrap_or(error.code);
+                    Some(AppError::new("ccSwitchImportSkipped").detail(detail))
+                }
+            };
             ensure_real_directory(&candidate)?;
             let _ = manifest(&candidate)?;
             sync_tree(&candidate)?;
-            Ok(())
+            Ok(warning)
         })();
-        if let Err(error) = applied {
-            let _ = remove_owned(&candidate);
-            let _ = remove_owned(&markers);
-            return Err(error);
-        }
+        let warning = match applied {
+            Ok(warning) => warning,
+            Err(error) => {
+                let _ = remove_owned(&candidate);
+                let _ = remove_owned(&markers);
+                return Err(error);
+            }
+        };
 
         self.write_journal(Journal {
             version: 1,
@@ -215,12 +263,20 @@ impl MigrationService {
         })?;
         let previous = self.previous(transaction_id);
         let publication = (|| -> AppResult<()> {
-            fs::rename(&self.paths.dsh_home, &previous)?;
+            rename_with_retry(
+                &self.paths.dsh_home,
+                &previous,
+                "migrationPublicationFailed",
+            )?;
             sync_parent(&self.paths.dsh_home)?;
             if manifest(&previous)? != original_manifest {
                 return Err(AppError::new("configurationChanged"));
             }
-            fs::rename(&candidate, &self.paths.dsh_home)?;
+            rename_with_retry(
+                &candidate,
+                &self.paths.dsh_home,
+                "migrationPublicationFailed",
+            )?;
             sync_parent(&self.paths.dsh_home)?;
             self.write_journal(Journal {
                 version: 1,
@@ -240,7 +296,7 @@ impl MigrationService {
                 return Err(error);
             }
         }
-        Ok(plan)
+        Ok(MigrationOutcome { plan, warning })
     }
 
     fn recover_locked(&self) -> AppResult<()> {
@@ -262,9 +318,13 @@ impl MigrationService {
                 if previous.exists() || previous.is_symlink() {
                     remove_owned(&failed)?;
                     if self.paths.dsh_home.exists() || self.paths.dsh_home.is_symlink() {
-                        fs::rename(&self.paths.dsh_home, &failed)?;
+                        rename_with_retry(
+                            &self.paths.dsh_home,
+                            &failed,
+                            "migrationRecoveryFailed",
+                        )?;
                     }
-                    fs::rename(&previous, &self.paths.dsh_home)?;
+                    rename_with_retry(&previous, &self.paths.dsh_home, "migrationRecoveryFailed")?;
                     remove_owned(&failed)?;
                 }
                 remove_owned(&candidate)?;
@@ -273,7 +333,7 @@ impl MigrationService {
             }
             JournalState::Committed => {
                 if !self.paths.dsh_home.exists() && previous.exists() {
-                    fs::rename(&previous, &self.paths.dsh_home)?;
+                    rename_with_retry(&previous, &self.paths.dsh_home, "migrationRecoveryFailed")?;
                     let _ = fs::remove_file(&self.paths.migration_complete_marker);
                     remove_owned(&candidate)?;
                     remove_owned(&markers)?;
@@ -350,6 +410,90 @@ fn read_journal(path: &Path) -> AppResult<Option<Journal>> {
 
 fn marker_complete(path: &Path) -> bool {
     fs::read(path).is_ok_and(|bytes| bytes == COMPLETE)
+}
+
+fn rename_with_retry(source: &Path, destination: &Path, code: &'static str) -> AppResult<()> {
+    #[cfg(windows)]
+    {
+        let mut delay = std::time::Duration::from_millis(40);
+        for attempt in 0..8 {
+            match fs::rename(source, destination) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::PermissionDenied && attempt < 7 =>
+                {
+                    std::thread::sleep(delay);
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_millis(640));
+                }
+                Err(error) => {
+                    return Err(AppError::io(code, &error)
+                        .value("source", path_label(source))
+                        .value("destination", path_label(destination)));
+                }
+            }
+        }
+        unreachable!("the bounded retry loop always returns")
+    }
+    #[cfg(not(windows))]
+    fs::rename(source, destination).map_err(|error| {
+        AppError::io(code, &error)
+            .value("source", path_label(source))
+            .value("destination", path_label(destination))
+    })
+}
+
+fn path_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "application-data".into())
+}
+
+#[cfg(windows)]
+fn make_cc_switch_targets_writable(dsh_home: &Path) -> AppResult<Vec<PathBuf>> {
+    let mut changed = Vec::new();
+    for name in ["settings.yaml", ".credentials.yaml"] {
+        let path = dsh_home.join(name);
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.permissions().readonly()
+        {
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&path, permissions).map_err(|error| {
+                AppError::io("ccSwitchCandidatePermissionFailed", &error).value("path", name)
+            })?;
+            changed.push(path);
+        }
+    }
+    Ok(changed)
+}
+
+#[cfg(not(windows))]
+fn make_cc_switch_targets_writable(_dsh_home: &Path) -> AppResult<Vec<PathBuf>> {
+    Ok(Vec::new())
+}
+
+#[cfg(windows)]
+fn restore_readonly(paths: &[PathBuf]) -> AppResult<()> {
+    for path in paths {
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(path, permissions).map_err(|error| {
+            AppError::io("ccSwitchCandidatePermissionFailed", &error)
+                .value("path", path_label(path))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn restore_readonly(_paths: &[PathBuf]) -> AppResult<()> {
+    Ok(())
 }
 
 fn ensure_real_directory(path: &Path) -> AppResult<()> {
@@ -583,6 +727,76 @@ mod tests {
             .path()
             .join("dsh-home/existing");
         assert_eq!(fs::read(backup).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn cc_switch_failure_is_reported_but_does_not_block_source_import() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        fs::write(paths.dsh_home.join("existing"), b"keep").unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("imported"), b"new").unwrap();
+        let service = MigrationService::isolated(paths.clone(), source, temp.path().join("cc"));
+
+        let outcome = service
+            .apply_with(|_, _, _| {
+                Err(AppError::new("ccSwitchDatabaseUnreadable").detail("access denied"))
+            })
+            .unwrap();
+
+        assert_eq!(outcome.plan.source_entries, 1);
+        assert_eq!(
+            outcome
+                .warning
+                .as_ref()
+                .map(|warning| warning.code.as_str()),
+            Some("ccSwitchImportSkipped")
+        );
+        assert_eq!(fs::read(paths.dsh_home.join("existing")).unwrap(), b"keep");
+        assert_eq!(fs::read(paths.dsh_home.join("imported")).unwrap(), b"new");
+        assert!(marker_complete(&paths.migration_complete_marker));
+    }
+
+    #[test]
+    fn rename_errors_include_the_migration_stage_and_relative_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-candidate");
+        let destination = temp.path().join("dsh-home");
+
+        let error =
+            rename_with_retry(&missing, &destination, "migrationPublicationFailed").unwrap_err();
+
+        assert_eq!(error.code, "migrationPublicationFailed");
+        assert_eq!(
+            error.values.get("source").map(String::as_str),
+            Some("missing-candidate")
+        );
+        assert_eq!(
+            error.values.get("destination").map(String::as_str),
+            Some("dsh-home")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn readonly_cc_switch_targets_are_changed_only_in_the_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let candidate = temp.path().join("candidate");
+        fs::create_dir(&candidate).unwrap();
+        let settings = candidate.join("settings.yaml");
+        fs::write(&settings, b"model: keep\n").unwrap();
+        let mut permissions = fs::metadata(&settings).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&settings, permissions).unwrap();
+
+        let changed = make_cc_switch_targets_writable(&candidate).unwrap();
+        assert_eq!(changed, vec![settings.clone()]);
+        assert!(!fs::metadata(&settings).unwrap().permissions().readonly());
+
+        restore_readonly(&changed).unwrap();
+        assert!(fs::metadata(&settings).unwrap().permissions().readonly());
     }
 
     #[test]

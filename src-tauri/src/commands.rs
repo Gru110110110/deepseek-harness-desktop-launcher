@@ -86,8 +86,3 @@ pub async fn application_check_update(
 pub async fn application_install_update(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
     state.inner().install_desktop_update().await
 }
-
-#[tauri::command]
-pub fn application_quit(state: State<'_, Arc<AppState>>) {
-    state.quit();
-}
