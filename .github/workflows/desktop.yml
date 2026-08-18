@@ -129,8 +129,7 @@ jobs:
         shell: pwsh
         run: |
           $output = @(& cargo test -p dsh-core --lib --target ${{ matrix.target }} `
-            service::tests::windows_process_guard_closes_descendants_and_releases_their_port `
-            -- --exact 2>&1)
+            windows_ -- --nocapture 2>&1)
           $exitCode = $LASTEXITCODE
           $output | ForEach-Object { Write-Host $_ }
           if ($exitCode -ne 0) {

@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use fs2::FileExt;
+use fs2::{FileExt, lock_contended_error};
 use reqwest::blocking::Client;
 use semver::Version;
 use serde_json::Value;
@@ -1123,6 +1123,10 @@ pub(crate) enum WindowsProcessGuard {
 
 #[cfg(windows)]
 unsafe impl Send for WindowsProcessGuard {}
+// Job handles are safe to query and terminate concurrently. The snapshot
+// fallback protects its mutable handle map with a mutex.
+#[cfg(windows)]
+unsafe impl Sync for WindowsProcessGuard {}
 
 #[cfg(windows)]
 impl WindowsProcessGuard {
@@ -1193,8 +1197,21 @@ impl WindowsProcessGuard {
                 {
                     match open_process_handle(pid) {
                         Ok(handle) => {
-                            processes.insert(pid, handle);
-                            changed = true;
+                            let handle = WindowsOwnedHandle(handle);
+                            if !process_handle_running(handle.0).map_err(|error| {
+                                AppError::io("serviceProcessGuardFailed", &error)
+                            })? {
+                                continue;
+                            }
+                            let confirmed_parent = windows_process_entries()?.into_iter().find_map(
+                                |(candidate, parent)| (candidate == pid).then_some(parent),
+                            );
+                            if confirmed_parent
+                                .is_some_and(|parent| processes.contains_key(&parent))
+                            {
+                                processes.insert(pid, handle.into_raw());
+                                changed = true;
+                            }
                         }
                         Err(error) if error.raw_os_error() == Some(87) => {}
                         Err(error) => {
@@ -1231,6 +1248,7 @@ impl WindowsProcessGuard {
                     .values()
                 {
                     if process_handle_running(*handle)
+                        .map_err(|error| AppError::io("serviceProcessGuardFailed", &error))?
                         && unsafe { TerminateProcess(*handle, 1) } == 0
                     {
                         return Err(AppError::io(
@@ -1283,7 +1301,10 @@ impl WindowsProcessGuard {
                         .lock()
                         .expect("Windows process guard poisoned")
                         .values()
-                        .all(|handle| !process_handle_running(*handle))
+                        .try_fold(true, |all_stopped, handle| {
+                            process_handle_running(*handle).map(|running| all_stopped && !running)
+                        })
+                        .map_err(|error| AppError::io("serviceProcessGuardFailed", &error))?
                     {
                         return Ok(true);
                     }
@@ -1313,7 +1334,7 @@ impl Drop for WindowsProcessGuard {
                     .values()
                 {
                     unsafe {
-                        if process_handle_running(*handle) {
+                        if process_handle_running(*handle).unwrap_or(true) {
                             TerminateProcess(*handle, 1);
                         }
                         CloseHandle(*handle);
@@ -1398,17 +1419,27 @@ fn open_process_handle(pid: u32) -> std::io::Result<windows_sys::Win32::Foundati
 }
 
 #[cfg(windows)]
-fn process_handle_running(handle: windows_sys::Win32::Foundation::HANDLE) -> bool {
-    use windows_sys::Win32::{Foundation::WAIT_TIMEOUT, System::Threading::WaitForSingleObject};
+fn process_handle_running(handle: windows_sys::Win32::Foundation::HANDLE) -> std::io::Result<bool> {
+    use windows_sys::Win32::{
+        Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::WaitForSingleObject,
+    };
 
-    unsafe { WaitForSingleObject(handle, 0) == WAIT_TIMEOUT }
+    match unsafe { WaitForSingleObject(handle, 0) } {
+        WAIT_TIMEOUT => Ok(true),
+        WAIT_OBJECT_0 => Ok(false),
+        WAIT_FAILED => Err(std::io::Error::last_os_error()),
+        result => Err(std::io::Error::other(format!(
+            "unexpected process wait result {result}"
+        ))),
+    }
 }
 
 #[cfg(windows)]
 fn windows_process_entries() -> std::io::Result<Vec<(u32, u32)>> {
     use std::mem::size_of;
     use windows_sys::Win32::{
-        Foundation::INVALID_HANDLE_VALUE,
+        Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
         System::Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
             TH32CS_SNAPPROCESS,
@@ -1425,12 +1456,22 @@ fn windows_process_entries() -> std::io::Result<Vec<(u32, u32)>> {
         ..Default::default()
     };
     let mut entries = Vec::new();
-    if unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0 {
-        loop {
-            entries.push((entry.th32ProcessID, entry.th32ParentProcessID));
-            if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
-                break;
+    if unsafe { Process32FirstW(snapshot.0, &mut entry) } == 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+            Ok(entries)
+        } else {
+            Err(error)
+        };
+    }
+    loop {
+        entries.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+                return Err(error);
             }
+            break;
         }
     }
     Ok(entries)
@@ -1438,16 +1479,15 @@ fn windows_process_entries() -> std::io::Result<Vec<(u32, u32)>> {
 
 fn acquire_lock(file: &File, controller: &DeploymentController) -> AppResult<()> {
     let deadline = Instant::now() + Duration::from_secs(15 * 60);
+    let contended = lock_contended_error().kind();
     loop {
         controller.check()?;
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(()),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
-            {
+            Err(error) if error.kind() == contended && Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(200))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if error.kind() == contended => {
                 return Err(AppError::new("deploymentBusy"));
             }
             Err(error) => return Err(error.into()),

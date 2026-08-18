@@ -160,13 +160,23 @@ a:focus-visible {
   color: var(--brand);
 }
 .sidebar-steps {
+  position: relative;
   display: grid;
   gap: 16px;
   margin: 1px 10px;
   padding-left: 3px;
-  border-left: 1px solid var(--border);
+}
+.sidebar-steps::before {
+  position: absolute;
+  top: 11.5px;
+  bottom: 11.5px;
+  left: 2px;
+  width: 1px;
+  background: var(--border);
+  content: "";
 }
 .step-row {
+  position: relative;
   display: flex;
   gap: 11px;
   align-items: center;
@@ -177,7 +187,10 @@ a:focus-visible {
   color: var(--text);
 }
 .step-number {
+  position: relative;
+  z-index: 1;
   display: grid;
+  flex: 0 0 21px;
   place-items: center;
   width: 21px;
   height: 21px;
@@ -303,9 +316,47 @@ a:focus-visible {
 }
 
 .main-content {
+  position: relative;
   display: flex;
   min-width: 0;
   overflow: auto;
+}
+.external-links {
+  position: absolute;
+  z-index: 2;
+  top: 14px;
+  right: 17px;
+  display: flex;
+  gap: 8px;
+}
+.external-link-button {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  box-shadow: 0 4px 14px rgb(22 37 66 / 6%);
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    background 120ms ease,
+    transform 120ms ease;
+}
+.external-link-button:hover {
+  border-color: color-mix(in srgb, var(--brand) 48%, var(--border));
+  background: var(--surface);
+  transform: translateY(-1px);
+}
+.external-link-icon {
+  width: 19px;
+  height: 19px;
+  object-fit: contain;
+}
+:root[data-theme="dark"] .github-icon {
+  filter: invert(1);
 }
 .launcher-page {
   display: flex;

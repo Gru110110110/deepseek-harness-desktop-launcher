@@ -3,7 +3,7 @@ members = ["crates/dsh-core", "src-tauri"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Gru110110110/deepseek-harness-desktop-launcher"
@@ -30,7 +30,7 @@ ts-rs = { version = "11.1", features = ["serde-compat"] }
 url = "2.5"
 uuid = { version = "1.18", features = ["serde", "v4"] }
 walkdir = "2.5"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Wdk_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_Shell"] }
 zip = { version = "5.1", default-features = false, features = ["deflate"] }
 
 [profile.release]

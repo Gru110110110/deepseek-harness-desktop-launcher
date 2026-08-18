@@ -30,6 +30,7 @@ pub struct ApplicationPaths {
     pub migration_lock: PathBuf,
     pub migration_backups_dir: PathBuf,
     pub deployment_lock: PathBuf,
+    pub launcher_lock: PathBuf,
 }
 
 impl ApplicationPaths {
@@ -71,6 +72,7 @@ impl ApplicationPaths {
             migration_lock: app_home.join(".migration.lock"),
             migration_backups_dir: app_home.join("backups"),
             deployment_lock: runtime_dir.join(".deployment.lock"),
+            launcher_lock: app_home.join(".launcher.lock"),
             app_home,
             runtime_dir,
             node_dir,
@@ -135,6 +137,7 @@ mod tests {
                 .ends_with("runtime/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js")
         );
         assert!(paths.dsh_home.ends_with("dsh-home"));
+        assert!(paths.launcher_lock.ends_with(".launcher.lock"));
         assert!(
             paths
                 .cc_switch_import_marker

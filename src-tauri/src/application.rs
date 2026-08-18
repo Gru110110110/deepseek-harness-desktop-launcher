@@ -1,4 +1,5 @@
 use std::{
+    fs::{File, OpenOptions},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -20,6 +21,7 @@ use dsh_core::{
     },
     service::ServerManager,
 };
+use fs2::{FileExt, lock_contended_error};
 use semver::Version;
 use tauri::{
     AppHandle, Emitter, Manager, RunEvent, WindowEvent,
@@ -31,12 +33,24 @@ use tauri_plugin_updater::UpdaterExt;
 use crate::commands;
 
 const WEBSITE: &str = "https://dsdesktop.com/";
+const GITHUB_REPOSITORY: &str = "https://github.com/Gru110110110/deepseek-harness-desktop-launcher";
+const DEEPSEEK_PLATFORM: &str = "https://platform.deepseek.com/";
+const INSTANCE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const DESKTOP_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
 const DESKTOP_UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+fn external_link_url(target: &str) -> Option<&'static str> {
+    match target {
+        "github" => Some(GITHUB_REPOSITORY),
+        "deepseek" => Some(DEEPSEEK_PLATFORM),
+        _ => None,
+    }
+}
 
 pub(crate) struct AppState {
     app: AppHandle,
     paths: ApplicationPaths,
+    _instance_lock: File,
     snapshot: Mutex<LauncherSnapshot>,
     preferences: Mutex<Preferences>,
     browsers: BrowserCatalog,
@@ -52,6 +66,7 @@ pub(crate) struct AppState {
 
 impl AppState {
     fn new(app: AppHandle, paths: ApplicationPaths) -> AppResult<Arc<Self>> {
+        let instance_lock = acquire_instance_lock(&paths)?;
         let preferences = Preferences::load(&paths.preferences_file, &paths.language_file);
         let browsers = BrowserCatalog::discover();
         let mut snapshot = LauncherSnapshot::initial(env!("CARGO_PKG_VERSION"));
@@ -67,6 +82,7 @@ impl AppState {
         let migration = MigrationService::from_environment(paths.clone())?;
         Ok(Arc::new(Self {
             app,
+            _instance_lock: instance_lock,
             server: Mutex::new(ServerManager::new(paths.clone())),
             paths,
             snapshot: Mutex::new(snapshot),
@@ -464,6 +480,10 @@ impl AppState {
     pub(crate) fn open_website(&self) -> AppResult<()> {
         self.browsers.open("system", WEBSITE)
     }
+    pub(crate) fn open_external_link(&self, target: &str) -> AppResult<()> {
+        let url = external_link_url(target).ok_or_else(|| AppError::new("externalLinkInvalid"))?;
+        self.browsers.open("system", url)
+    }
     pub(crate) fn web_url(&self) -> AppResult<String> {
         self.snapshot()
             .web_url
@@ -767,6 +787,36 @@ impl AppState {
     }
 }
 
+fn acquire_instance_lock(paths: &ApplicationPaths) -> AppResult<File> {
+    acquire_instance_lock_with_timeout(paths, INSTANCE_LOCK_TIMEOUT)
+}
+
+fn acquire_instance_lock_with_timeout(
+    paths: &ApplicationPaths,
+    timeout: Duration,
+) -> AppResult<File> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&paths.launcher_lock)
+        .map_err(|error| AppError::io("launcherLockFailed", &error))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => return Ok(lock),
+            Err(error) if error.kind() == lock_contended_error().kind() => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(AppError::new("launcherAlreadyRunning"));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(AppError::io("launcherLockFailed", &error)),
+        }
+    }
+}
+
 struct DesktopUpdateOperation {
     state: Arc<AppState>,
 }
@@ -855,7 +905,7 @@ fn lifecycle_decision(exit_ready: bool, tray_available: bool) -> LifecycleDecisi
 }
 
 pub fn run() {
-    if handle_cli_probe() {
+    if dsh_core::service::handle_service_guard_cli() || handle_cli_probe() {
         return;
     }
     tauri::Builder::default()
@@ -910,6 +960,7 @@ pub fn run() {
             commands::launcher_select_browser,
             commands::launcher_open_web_ui,
             commands::application_open_website,
+            commands::application_open_external_link,
             commands::application_copy_web_url,
             commands::preferences_set_language,
             commands::preferences_set_theme,
@@ -981,11 +1032,51 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{LifecycleDecision, WEBSITE, lifecycle_decision};
+    use std::{thread, time::Duration};
+
+    use super::{
+        DEEPSEEK_PLATFORM, GITHUB_REPOSITORY, LifecycleDecision, WEBSITE, acquire_instance_lock,
+        acquire_instance_lock_with_timeout, external_link_url, lifecycle_decision,
+    };
+    use dsh_core::ApplicationPaths;
 
     #[test]
     fn product_website_uses_the_public_homepage() {
         assert_eq!(WEBSITE, "https://dsdesktop.com/");
+    }
+
+    #[test]
+    fn external_links_are_limited_to_known_destinations() {
+        assert_eq!(external_link_url("github"), Some(GITHUB_REPOSITORY));
+        assert_eq!(external_link_url("deepseek"), Some(DEEPSEEK_PLATFORM));
+        assert_eq!(external_link_url("unknown"), None);
+    }
+
+    #[test]
+    fn instance_lock_allows_only_one_launcher_per_desktop_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        let first = acquire_instance_lock(&paths).unwrap();
+        let error = acquire_instance_lock_with_timeout(&paths, Duration::ZERO).unwrap_err();
+        assert_eq!(error.code, "launcherAlreadyRunning");
+        drop(first);
+        acquire_instance_lock(&paths).unwrap();
+    }
+
+    #[test]
+    fn instance_lock_waits_for_a_restarting_launcher_to_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        let first = acquire_instance_lock(&paths).unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            drop(first);
+        });
+
+        acquire_instance_lock_with_timeout(&paths, Duration::from_secs(1)).unwrap();
+        release.join().unwrap();
     }
 
     #[test]

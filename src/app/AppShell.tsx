@@ -9,6 +9,8 @@ import { launcherApi } from "@/platform/launcherApi";
 import { useLauncherSnapshot } from "@/platform/launcherStore";
 import type { Language, ThemePreference } from "@/platform/generated/bindings";
 import logoUrl from "../../assets/logo-blue.png";
+import deepseekIconUrl from "../../assets/external/deepseek.png";
+import githubIconUrl from "../../assets/external/github.svg";
 import { presentError } from "@/shared/presentError";
 import { ThemeProvider } from "./ThemeProvider";
 
@@ -103,6 +105,13 @@ function ShellContent() {
     snapshot.desktopUpdate.kind === "checking" ||
     snapshot.desktopUpdate.kind === "downloading" ||
     snapshot.desktopUpdate.kind === "installing";
+  const openExternalLink = (target: "github" | "deepseek") => {
+    void launcherApi
+      .openExternalLink(target)
+      .catch((error: unknown) =>
+        toast.error(presentError(error, (key, values) => t(key, values))),
+      );
+  };
 
   return (
     <ThemeProvider theme={snapshot.theme}>
@@ -110,6 +119,8 @@ function ShellContent() {
         <aside className="sidebar">
           <button
             className="brand"
+            title={t("links.website")}
+            aria-label={t("links.website")}
             onClick={() =>
               void launcherApi
                 .openWebsite()
@@ -226,6 +237,40 @@ function ShellContent() {
           </div>
         </aside>
         <main className="main-content">
+          <div className="external-links" aria-label={t("links.external")}>
+            <button
+              className="external-link-button"
+              type="button"
+              title={t("links.github")}
+              aria-label={t("links.github")}
+              onClick={() => {
+                openExternalLink("github");
+              }}
+            >
+              <img
+                className="external-link-icon github-icon"
+                src={githubIconUrl}
+                alt=""
+                aria-hidden
+              />
+            </button>
+            <button
+              className="external-link-button"
+              type="button"
+              title={t("links.deepseekPlatform")}
+              aria-label={t("links.deepseekPlatform")}
+              onClick={() => {
+                openExternalLink("deepseek");
+              }}
+            >
+              <img
+                className="external-link-icon"
+                src={deepseekIconUrl}
+                alt=""
+                aria-hidden
+              />
+            </button>
+          </div>
           <Suspense
             fallback={<div className="route-loading" aria-label="Loading" />}
           >

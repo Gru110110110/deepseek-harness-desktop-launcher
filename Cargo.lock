@@ -783,7 +783,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "flate2",
  "fs2",
@@ -811,9 +811,10 @@ dependencies = [
 
 [[package]]
 name = "dsh-launcher"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "dsh-core",
+ "fs2",
  "log",
  "semver",
  "serde",
@@ -823,6 +824,7 @@ dependencies = [
  "tauri-plugin-clipboard-manager",
  "tauri-plugin-log",
  "tauri-plugin-updater",
+ "tempfile",
  "tokio",
 ]
 

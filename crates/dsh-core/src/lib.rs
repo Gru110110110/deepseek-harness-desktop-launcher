@@ -11,6 +11,7 @@ pub mod migration;
 pub mod model;
 pub mod paths;
 pub mod preferences;
+mod process_recovery;
 pub mod runtime;
 pub mod service;
 

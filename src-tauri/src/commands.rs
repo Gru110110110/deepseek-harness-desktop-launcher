@@ -50,6 +50,14 @@ pub fn application_open_website(state: State<'_, Arc<AppState>>) -> Result<(), A
 }
 
 #[tauri::command]
+pub fn application_open_external_link(
+    target: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), AppError> {
+    state.open_external_link(&target)
+}
+
+#[tauri::command]
 pub fn application_copy_web_url(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
