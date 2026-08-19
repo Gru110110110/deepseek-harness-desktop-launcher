@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { LauncherSnapshot } from "@/platform/generated/bindings";
-import { getHeaderCopy, getServiceCopy, getUpdateNotice } from "./presentation";
+import {
+  getHeaderCopy,
+  getServiceCopy,
+  getUpdateNotices,
+} from "./presentation";
 
 function snapshot(overrides: Partial<LauncherSnapshot> = {}): LauncherSnapshot {
   return {
@@ -83,29 +87,43 @@ describe("launcher presentation", () => {
       harnessUpdate: { kind: "installing", version: "0.1.0-rc.7" },
     });
 
-    expect(getUpdateNotice(value)).toBeNull();
+    expect(getUpdateNotices(value)).toEqual([]);
   });
 
-  it("shows exactly one update notice with desktop updates taking precedence", () => {
+  it("keeps a Harness version check in the sidebar", () => {
+    const value = snapshot({ harnessUpdate: { kind: "checking" } });
+
+    expect(getUpdateNotices(value)).toEqual([]);
+  });
+
+  it("shows desktop and Harness updates independently", () => {
     const value = snapshot({
-      desktopUpdate: {
-        kind: "downloading",
-        version: "0.3.0",
-        done: 50,
-        total: 100,
-      },
+      desktopUpdate: { kind: "available", version: "0.3.0" },
       harnessUpdate: { kind: "available", version: "0.1.0-rc.7" },
     });
 
-    expect(getUpdateNotice(value)).toEqual({
-      message: {
-        key: "update.desktop.downloading",
-        values: { version: "0.3.0", percent: 50 },
+    expect(getUpdateNotices(value)).toEqual([
+      {
+        source: "desktop",
+        message: {
+          key: "update.desktop.available",
+          values: { version: "0.3.0" },
+        },
+        tone: "info",
+        action: "installDesktop",
+        actionLabel: "action.updateDesktop",
       },
-      tone: "info",
-      action: null,
-      actionLabel: null,
-    });
+      {
+        source: "harness",
+        message: {
+          key: "update.harness.available",
+          values: { version: "0.1.0-rc.7" },
+        },
+        tone: "info",
+        action: "updateHarness",
+        actionLabel: "action.updateHarness",
+      },
+    ]);
   });
 
   it("prompts before downloading an available desktop update", () => {
@@ -113,32 +131,35 @@ describe("launcher presentation", () => {
       desktopUpdate: { kind: "available", version: "0.3.0" },
     });
 
-    expect(getUpdateNotice(value)).toEqual({
-      message: {
-        key: "update.desktop.available",
-        values: { version: "0.3.0" },
+    expect(getUpdateNotices(value)).toEqual([
+      {
+        source: "desktop",
+        message: {
+          key: "update.desktop.available",
+          values: { version: "0.3.0" },
+        },
+        tone: "info",
+        action: "installDesktop",
+        actionLabel: "action.updateDesktop",
       },
-      tone: "info",
-      action: "installDesktop",
-      actionLabel: "action.updateDesktop",
-    });
+    ]);
   });
 
   it("offers the correct recovery action for check and install failures", () => {
     expect(
-      getUpdateNotice(
+      getUpdateNotices(
         snapshot({ desktopUpdate: { kind: "failed", version: null } }),
-      ),
+      )[0],
     ).toMatchObject({
       action: "checkDesktop",
       actionLabel: "action.retryCheckUpdate",
     });
     expect(
-      getUpdateNotice(
+      getUpdateNotices(
         snapshot({
           desktopUpdate: { kind: "failed", version: "0.3.0" },
         }),
-      ),
+      )[0],
     ).toMatchObject({
       action: "installDesktop",
       actionLabel: "action.retryUpdate",
@@ -155,7 +176,7 @@ describe("launcher presentation", () => {
       },
     });
 
-    expect(getUpdateNotice(value)?.message).toEqual({
+    expect(getUpdateNotices(value)[0]?.message).toEqual({
       key: "update.desktop.downloadingUnknown",
       values: { version: "0.3.0", percent: 0 },
     });

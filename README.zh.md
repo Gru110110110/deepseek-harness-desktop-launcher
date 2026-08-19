@@ -14,7 +14,7 @@ DSH Launcher 是已发布 `@deepseek-ai/dsh` 包的非官方桌面启动器。�
 - 精确安装 `@deepseek-ai/dsh`，支持 npm registry 回退
 - staging、可执行 smoke 校验、原子发布、启动恢复与失败回滚
 - 浏览器选择、系统托盘生命周期、中英双语、浅色/深色/跟随系统主题
-- Harness 更新与带密码学签名的桌面应用更新相互独立
+- Harness 更新与带密码学签名的桌面应用更新相互独立；两者都会自动检查，也可点击侧栏版本号手动检查，同时有新版时分别显示并由用户选择更新顺序
 
 Python/PyInstaller 版本无法识别 Tauri 更新产物。老用户需要手动安装第一版 Tauri 应用；新应用会直接复用兼容的 `~/.dsh-desktop` 目录。此后只在后台检查并先提示新版本，不会提前下载。用户确认后，后端会连续完成签名包下载、安装、安全停止 Harness 与重启。
 
@@ -111,16 +111,16 @@ pnpm tauri dev
 
 ## 运行环境变量
 
-| 变量                         | 含义                                                                              |
-| ---------------------------- | --------------------------------------------------------------------------------- |
-| `DSH_DESKTOP_HOME`           | 启动器/运行环境目录，默认 `~/.dsh-desktop`                                        |
-| `DSH_HOME`                   | 显式外部 Harness 目录；会绕过桌面端隔离的 `dsh-home` 并关闭全部导入，只应有意设置 |
-| `DSH_DESKTOP_SOURCE_HOME`    | 可选的 source home，默认 `~/.dsh`                                                 |
-| `DSH_DESKTOP_CC_SWITCH_HOME` | 可选的只读 CC Switch 来源，默认 `~/.cc-switch`                                    |
-| `DSH_DESKTOP_NODE_VERSION`   | 精确 Node 覆盖值；必须同时设置 `DSH_DESKTOP_NODE_SHA256`                          |
-| `DSH_DESKTOP_NODE_SHA256`    | 自定义 Node 归档的 SHA-256 信任根                                                 |
-| `DSH_DESKTOP_NODE_BASES`     | 逗号分隔的 Node 镜像；显式配置会关闭默认回退                                      |
-| `DSH_DESKTOP_NPM_REGISTRIES` | 逗号分隔的 npm registry；显式配置会关闭默认回退                                   |
+| 变量                         | 含义                                                                                                                               |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `DSH_DESKTOP_HOME`           | 启动器/运行环境目录，默认 `~/.dsh-desktop`                                                                                         |
+| `DSH_HOME`                   | 显式外部 Harness 目录；会绕过桌面端隔离的 `dsh-home` 并关闭全部导入，只应有意设置                                                  |
+| `DSH_DESKTOP_SOURCE_HOME`    | 可选的 source home，默认 `~/.dsh`                                                                                                  |
+| `DSH_DESKTOP_CC_SWITCH_HOME` | 可选的只读 CC Switch 来源；Windows 默认跟随 CC Switch 当前数据目录（含 Store 覆盖和旧版 `HOME` 回退），其他平台默认 `~/.cc-switch` |
+| `DSH_DESKTOP_NODE_VERSION`   | 精确 Node 覆盖值；必须同时设置 `DSH_DESKTOP_NODE_SHA256`                                                                           |
+| `DSH_DESKTOP_NODE_SHA256`    | 自定义 Node 归档的 SHA-256 信任根                                                                                                  |
+| `DSH_DESKTOP_NODE_BASES`     | 逗号分隔的 Node 镜像；显式配置会关闭默认回退                                                                                       |
+| `DSH_DESKTOP_NPM_REGISTRIES` | 逗号分隔的 npm registry；显式配置会关闭默认回退                                                                                    |
 
 ## 许可
 

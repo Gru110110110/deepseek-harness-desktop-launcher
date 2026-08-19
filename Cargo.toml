@@ -3,13 +3,14 @@ members = ["crates/dsh-core", "src-tauri"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Gru110110110/deepseek-harness-desktop-launcher"
 rust-version = "1.96"
 
 [workspace.dependencies]
+dirs = "6.0"
 fs2 = "0.4"
 flate2 = "1.1"
 hex = "0.4"

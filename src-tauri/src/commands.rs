@@ -22,6 +22,13 @@ pub fn launcher_update_harness(state: State<'_, Arc<AppState>>) {
 }
 
 #[tauri::command]
+pub async fn launcher_check_harness_update(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<String>, AppError> {
+    state.inner().check_harness_update().await
+}
+
+#[tauri::command]
 pub fn migration_approve(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
     state.inner().approve_migration()
 }

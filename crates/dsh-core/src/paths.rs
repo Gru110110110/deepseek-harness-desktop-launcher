@@ -95,9 +95,12 @@ impl ApplicationPaths {
 }
 
 pub fn dirs_home() -> AppResult<PathBuf> {
-    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
+    #[cfg(windows)]
+    let home = dirs::home_dir();
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+
+    home.filter(|path| !path.as_os_str().is_empty())
         .ok_or_else(|| AppError::new("homeUnavailable"))
 }
 

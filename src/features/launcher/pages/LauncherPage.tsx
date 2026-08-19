@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import {
   Check,
   ChevronDown,
@@ -16,10 +16,11 @@ import { useLauncherSnapshot } from "@/platform/launcherStore";
 import { formatDuration } from "@/shared/time";
 import { useNow } from "@/shared/useNow";
 import { presentError } from "@/shared/presentError";
+import { showMigrationWarning, showTimedError } from "@/shared/errorToast";
 import {
   getHeaderCopy,
   getServiceCopy,
-  getUpdateNotice,
+  getUpdateNotices,
 } from "../presentation";
 
 export function LauncherPage() {
@@ -28,13 +29,22 @@ export function LauncherPage() {
   const now = useNow();
   const headerCopy = getHeaderCopy(snapshot);
   const serviceCopy = getServiceCopy(snapshot);
-  const updateNotice = getUpdateNotice(snapshot);
+  const updateNotices = getUpdateNotices(snapshot);
+  const desktopUpdateBlocked = snapshot.harnessUpdate.kind === "installing";
+  const harnessUpdateBlocked =
+    snapshot.phase !== "ready" ||
+    snapshot.desktopUpdate.kind === "checking" ||
+    snapshot.desktopUpdate.kind === "downloading" ||
+    snapshot.desktopUpdate.kind === "installing";
   const selectedBrowser = snapshot.browsers.find(
     (item) => item.id === snapshot.selectedBrowserId,
   );
   const browserLabel = (id: string, label: string) =>
     id === "system" ? t("browser.default") : label;
   const running = snapshot.phase === "ready";
+  const presentTimedError = (error: unknown) => {
+    showTimedError(error, (key, values) => t(key, values));
+  };
   const migrationPlan =
     snapshot.migration.kind === "pending" ? snapshot.migration.plan : null;
   const awaitingMigration = migrationPlan !== null;
@@ -44,6 +54,9 @@ export function LauncherPage() {
       t(key, values),
     );
   }, [snapshot.migration, t]);
+  useEffect(() => {
+    if (migrationWarning) showMigrationWarning(migrationWarning);
+  }, [migrationWarning]);
   const elapsed = snapshot.serviceStartedAtMs
     ? formatDuration(now - snapshot.serviceStartedAtMs)
     : null;
@@ -71,7 +84,7 @@ export function LauncherPage() {
 
   const run = (task: Promise<unknown>): void => {
     void task.catch((error: unknown) => {
-      toast.error(presentError(error, (key, values) => t(key, values)));
+      presentTimedError(error);
     });
   };
   const primary = () => {
@@ -219,8 +232,9 @@ export function LauncherPage() {
         </div>
       )}
 
-      {updateNotice && (
+      {updateNotices.map((updateNotice) => (
         <div
+          key={updateNotice.source}
           className={`update-banner${updateNotice.tone === "error" ? " error" : ""}`}
         >
           <span>
@@ -228,6 +242,7 @@ export function LauncherPage() {
           </span>
           {updateNotice.action === "installDesktop" && (
             <button
+              disabled={desktopUpdateBlocked}
               onClick={() => {
                 run(launcherApi.installDesktopUpdate());
               }}
@@ -237,6 +252,7 @@ export function LauncherPage() {
           )}
           {updateNotice.action === "checkDesktop" && (
             <button
+              disabled={desktopUpdateBlocked}
               onClick={() => {
                 run(launcherApi.checkDesktopUpdate());
               }}
@@ -246,6 +262,7 @@ export function LauncherPage() {
           )}
           {updateNotice.action === "updateHarness" && (
             <button
+              disabled={harnessUpdateBlocked}
               onClick={() => {
                 run(launcherApi.updateHarness());
               }}
@@ -254,13 +271,7 @@ export function LauncherPage() {
             </button>
           )}
         </div>
-      )}
-
-      {migrationWarning && (
-        <div className="update-banner error" role="alert">
-          <span>{migrationWarning}</span>
-        </div>
-      )}
+      ))}
 
       {!awaitingMigration && (
         <footer className="page-actions">

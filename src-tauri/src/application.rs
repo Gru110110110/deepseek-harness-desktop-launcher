@@ -38,6 +38,7 @@ const DEEPSEEK_PLATFORM: &str = "https://platform.deepseek.com/";
 const INSTANCE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const DESKTOP_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
 const DESKTOP_UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const HARNESS_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn external_link_url(target: &str) -> Option<&'static str> {
     match target {
@@ -58,6 +59,7 @@ pub(crate) struct AppState {
     deployment: Mutex<Option<DeploymentController>>,
     migration: MigrationService,
     desktop_update_busy: AtomicBool,
+    harness_update_check_busy: AtomicBool,
     startup_thread: Mutex<Option<thread::JoinHandle<()>>>,
     quitting: AtomicBool,
     exit_ready: AtomicBool,
@@ -91,6 +93,7 @@ impl AppState {
             deployment: Mutex::new(None),
             migration,
             desktop_update_busy: AtomicBool::new(false),
+            harness_update_check_busy: AtomicBool::new(false),
             startup_thread: Mutex::new(None),
             quitting: AtomicBool::new(false),
             exit_ready: AtomicBool::new(false),
@@ -103,13 +106,23 @@ impl AppState {
     }
 
     fn mutate(&self, update: impl FnOnce(&mut LauncherSnapshot)) {
+        let _ = self.mutate_if(|snapshot| {
+            update(snapshot);
+            true
+        });
+    }
+
+    fn mutate_if(&self, update: impl FnOnce(&mut LauncherSnapshot) -> bool) -> bool {
         let value = {
             let mut snapshot = self.snapshot.lock().expect("snapshot poisoned");
-            update(&mut snapshot);
+            if !update(&mut snapshot) {
+                return false;
+            }
             snapshot.revision = snapshot.revision.saturating_add(1);
             snapshot.clone()
         };
         let _ = self.app.emit("launcher://state", value);
+        true
     }
 
     pub(crate) fn start(self: &Arc<Self>, force: bool, target_version: Option<String>) {
@@ -314,7 +327,10 @@ impl AppState {
                     snapshot.activity = None;
                     snapshot.error = None;
                 });
-                self.check_harness_update();
+                let state = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let _ = state.check_harness_update().await;
+                });
             }
             Err(error) => self.fail_unless_quitting(error),
         }
@@ -360,33 +376,77 @@ impl AppState {
         }
     }
 
-    fn check_harness_update(self: &Arc<Self>) {
-        let state = Arc::clone(self);
-        thread::spawn(move || {
-            if state.quitting.load(Ordering::SeqCst) {
-                return;
+    pub(crate) async fn check_harness_update(self: &Arc<Self>) -> AppResult<Option<String>> {
+        if self.quitting.load(Ordering::SeqCst) {
+            return Err(AppError::new("harnessUpdateCheckCancelled"));
+        }
+        let snapshot = self.snapshot();
+        if snapshot.phase != LauncherPhase::Ready {
+            return Err(AppError::new("serviceNotReady"));
+        }
+        let _operation = self.begin_harness_update_check()?;
+        let previous = snapshot.harness_update;
+        if matches!(&previous, HarnessUpdateState::Installing { .. }) {
+            return Err(AppError::new("harnessUpdateBusy"));
+        }
+        let current_value = snapshot
+            .harness_version
+            .ok_or_else(|| AppError::new("serviceNotReady"))?;
+        let current = Version::parse(&current_value)
+            .map_err(|_| AppError::new("runtimeVersionInvalid").value("version", current_value))?;
+        if self.quitting.load(Ordering::SeqCst) {
+            return Err(AppError::new("harnessUpdateCheckCancelled"));
+        }
+        if !self.mutate_if(|snapshot| mark_harness_update_checking(snapshot, &previous)) {
+            return Err(AppError::new("harnessUpdateBusy"));
+        }
+
+        let controller = DeploymentController::default();
+        let query_controller = controller.clone();
+        let query =
+            tauri::async_runtime::spawn_blocking(move || latest_harness_version(&query_controller));
+        let result = match tokio::time::timeout(HARNESS_UPDATE_CHECK_TIMEOUT, query).await {
+            Ok(joined) => joined
+                .map_err(|error| AppError::new("versionQueryFailed").detail(error.to_string()))
+                .and_then(|result| result),
+            Err(_) => {
+                controller.cancel();
+                Err(AppError::new("harnessUpdateCheckTimedOut"))
             }
-            let controller = DeploymentController::default();
-            let Ok(latest) = latest_harness_version(&controller) else {
-                return;
-            };
-            let current = state
-                .snapshot()
-                .harness_version
-                .and_then(|value| Version::parse(&value).ok());
-            if Version::parse(&latest)
-                .ok()
-                .zip(current)
-                .is_some_and(|(latest, current)| latest > current)
-            {
-                if state.quitting.load(Ordering::SeqCst) {
-                    return;
-                }
-                state.mutate(|snapshot| {
-                    snapshot.harness_update = HarnessUpdateState::Available { version: latest }
+        };
+
+        if self.quitting.load(Ordering::SeqCst) {
+            controller.cancel();
+            let _ =
+                self.mutate_if(|snapshot| replace_harness_update_if_checking(snapshot, previous));
+            return Err(AppError::new("harnessUpdateCheckCancelled"));
+        }
+
+        match result {
+            Ok(latest) => {
+                let available = Version::parse(&latest)
+                    .ok()
+                    .filter(|latest| latest > &current)
+                    .map(|_| latest);
+                let _ = self.mutate_if(|snapshot| {
+                    replace_harness_update_if_checking(
+                        snapshot,
+                        available
+                            .clone()
+                            .map_or(HarnessUpdateState::None, |version| {
+                                HarnessUpdateState::Available { version }
+                            }),
+                    )
                 });
+                Ok(available)
             }
-        });
+            Err(error) => {
+                log::warn!("Harness update check failed: {error}");
+                let _ = self
+                    .mutate_if(|snapshot| replace_harness_update_if_checking(snapshot, previous));
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn update_harness(self: &Arc<Self>) {
@@ -494,6 +554,15 @@ impl AppState {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| AppError::new("desktopUpdateBusy"))?;
         Ok(DesktopUpdateOperation {
+            state: Arc::clone(self),
+        })
+    }
+
+    fn begin_harness_update_check(self: &Arc<Self>) -> AppResult<HarnessUpdateCheckOperation> {
+        self.harness_update_check_busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| AppError::new("harnessUpdateCheckBusy"))?;
+        Ok(HarnessUpdateCheckOperation {
             state: Arc::clone(self),
         })
     }
@@ -787,6 +856,29 @@ impl AppState {
     }
 }
 
+fn mark_harness_update_checking(
+    snapshot: &mut LauncherSnapshot,
+    expected: &HarnessUpdateState,
+) -> bool {
+    if snapshot.phase != LauncherPhase::Ready || &snapshot.harness_update != expected {
+        return false;
+    }
+    snapshot.harness_update = HarnessUpdateState::Checking;
+    true
+}
+
+fn replace_harness_update_if_checking(
+    snapshot: &mut LauncherSnapshot,
+    replacement: HarnessUpdateState,
+) -> bool {
+    if snapshot.harness_update == HarnessUpdateState::Checking {
+        snapshot.harness_update = replacement;
+        true
+    } else {
+        false
+    }
+}
+
 fn acquire_instance_lock(paths: &ApplicationPaths) -> AppResult<File> {
     acquire_instance_lock_with_timeout(paths, INSTANCE_LOCK_TIMEOUT)
 }
@@ -821,6 +913,18 @@ struct DesktopUpdateOperation {
     state: Arc<AppState>,
 }
 
+struct HarnessUpdateCheckOperation {
+    state: Arc<AppState>,
+}
+
+impl Drop for HarnessUpdateCheckOperation {
+    fn drop(&mut self) {
+        self.state
+            .harness_update_check_busy
+            .store(false, Ordering::SeqCst);
+    }
+}
+
 impl Drop for DesktopUpdateOperation {
     fn drop(&mut self) {
         self.state
@@ -831,8 +935,8 @@ impl Drop for DesktopUpdateOperation {
 
 fn tray_menu(app: &AppHandle, language: Language) -> tauri::Result<Menu<tauri::Wry>> {
     let (show, open_web, quit) = match language {
-        Language::Zh => ("显示启动主页面", "打开 Web UI", "退出"),
-        Language::En => ("Show launcher", "Open Web UI", "Quit"),
+        Language::Zh => ("打开启动主页面", "打开 DeepSeek Harness 工作台", "退出"),
+        Language::En => ("Open launcher", "Open DeepSeek Harness Workspace", "Quit"),
     };
     let show = MenuItem::with_id(app, "open", show, true, None::<&str>)?;
     let open_web = MenuItem::with_id(app, "web", open_web, true, None::<&str>)?;
@@ -954,6 +1058,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::launcher_get_snapshot,
             commands::launcher_retry,
+            commands::launcher_check_harness_update,
             commands::launcher_update_harness,
             commands::migration_approve,
             commands::migration_skip,
@@ -1037,8 +1142,9 @@ mod tests {
     use super::{
         DEEPSEEK_PLATFORM, GITHUB_REPOSITORY, LifecycleDecision, WEBSITE, acquire_instance_lock,
         acquire_instance_lock_with_timeout, external_link_url, lifecycle_decision,
+        mark_harness_update_checking, replace_harness_update_if_checking,
     };
-    use dsh_core::ApplicationPaths;
+    use dsh_core::{ApplicationPaths, HarnessUpdateState, LauncherSnapshot};
 
     #[test]
     fn product_website_uses_the_public_homepage() {
@@ -1050,6 +1156,66 @@ mod tests {
         assert_eq!(external_link_url("github"), Some(GITHUB_REPOSITORY));
         assert_eq!(external_link_url("deepseek"), Some(DEEPSEEK_PLATFORM));
         assert_eq!(external_link_url("unknown"), None);
+    }
+
+    #[test]
+    fn a_stale_harness_check_cannot_replace_an_installing_state() {
+        let mut snapshot = LauncherSnapshot::initial("0.2.2");
+        snapshot.harness_update = HarnessUpdateState::Installing {
+            version: "0.1.0-rc.8".into(),
+        };
+
+        assert!(!replace_harness_update_if_checking(
+            &mut snapshot,
+            HarnessUpdateState::None
+        ));
+
+        assert_eq!(
+            snapshot.harness_update,
+            HarnessUpdateState::Installing {
+                version: "0.1.0-rc.8".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_current_harness_check_can_publish_its_result() {
+        let mut snapshot = LauncherSnapshot::initial("0.2.2");
+        snapshot.harness_update = HarnessUpdateState::Checking;
+
+        assert!(replace_harness_update_if_checking(
+            &mut snapshot,
+            HarnessUpdateState::Available {
+                version: "0.1.0-rc.8".into(),
+            },
+        ));
+
+        assert_eq!(
+            snapshot.harness_update,
+            HarnessUpdateState::Available {
+                version: "0.1.0-rc.8".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_stale_harness_check_cannot_enter_checking() {
+        let mut snapshot = LauncherSnapshot::initial("0.2.2");
+        snapshot.phase = dsh_core::LauncherPhase::Ready;
+        snapshot.harness_update = HarnessUpdateState::Installing {
+            version: "0.1.0-rc.8".into(),
+        };
+
+        assert!(!mark_harness_update_checking(
+            &mut snapshot,
+            &HarnessUpdateState::Available {
+                version: "0.1.0-rc.8".into(),
+            }
+        ));
+        assert!(matches!(
+            snapshot.harness_update,
+            HarnessUpdateState::Installing { .. }
+        ));
     }
 
     #[test]

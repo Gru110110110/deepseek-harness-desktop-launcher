@@ -149,6 +149,7 @@ pub enum DesktopUpdateState {
 pub enum HarnessUpdateState {
     #[default]
     None,
+    Checking,
     Available {
         version: String,
     },

@@ -55,6 +55,7 @@ export type DesktopUpdateState =
 
 export type HarnessUpdateState =
   | { kind: "none" }
+  | { kind: "checking" }
   | { kind: "available"; version: string }
   | { kind: "installing"; version: string }
   | { kind: "failed"; version: string };

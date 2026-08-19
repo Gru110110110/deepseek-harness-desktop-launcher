@@ -783,8 +783,9 @@ dependencies = [
 
 [[package]]
 name = "dsh-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
+ "dirs",
  "flate2",
  "fs2",
  "hex",
@@ -811,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-launcher"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "dsh-core",
  "fs2",

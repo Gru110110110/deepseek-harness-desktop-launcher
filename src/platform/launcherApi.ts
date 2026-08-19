@@ -14,6 +14,8 @@ const action = (name: string, args?: Record<string, unknown>): Promise<void> =>
 export const launcherApi = {
   snapshot: () => command<LauncherSnapshot>("launcher_get_snapshot"),
   retry: () => action("launcher_retry"),
+  checkHarnessUpdate: () =>
+    command<string | null>("launcher_check_harness_update"),
   updateHarness: () => action("launcher_update_harness"),
   approveMigration: () => action("migration_approve"),
   skipMigration: () => action("migration_skip"),

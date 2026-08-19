@@ -75,17 +75,16 @@ impl MigrationService {
             });
         }
         let home = dirs_home()?;
+        let cc_switch_home = std::env::var_os("DSH_DESKTOP_CC_SWITCH_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| discover_cc_switch_home(&home));
         Ok(Self {
             source_home: Some(
                 std::env::var_os("DSH_DESKTOP_SOURCE_HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| home.join(".dsh")),
             ),
-            cc_switch_home: Some(
-                std::env::var_os("DSH_DESKTOP_CC_SWITCH_HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".cc-switch")),
-            ),
+            cc_switch_home: Some(cc_switch_home),
             paths,
         })
     }
@@ -412,6 +411,57 @@ fn marker_complete(path: &Path) -> bool {
     fs::read(path).is_ok_and(|bytes| bytes == COMPLETE)
 }
 
+fn discover_cc_switch_home(home: &Path) -> PathBuf {
+    let default = home.join(".cc-switch");
+    #[cfg(windows)]
+    {
+        if let Some(custom) = read_cc_switch_store_override(home)
+            && custom.join("cc-switch.db").is_file()
+        {
+            return custom;
+        }
+        if default.join("cc-switch.db").is_file() {
+            return default;
+        }
+        if let Some(legacy_home) = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty() && path != home)
+        {
+            let legacy = legacy_home.join(".cc-switch");
+            if legacy.join("cc-switch.db").is_file() {
+                return legacy;
+            }
+        }
+    }
+    default
+}
+
+#[cfg(windows)]
+fn read_cc_switch_store_override(home: &Path) -> Option<PathBuf> {
+    const MAX_STORE_BYTES: u64 = 1024 * 1024;
+
+    let store = dirs::data_dir()?
+        .join("com.ccswitch.desktop")
+        .join("app_paths.json");
+    let metadata = fs::symlink_metadata(&store).ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_STORE_BYTES
+    {
+        return None;
+    }
+    let document: serde_json::Value = serde_json::from_slice(&fs::read(store).ok()?).ok()?;
+    let raw = document.get("app_config_dir_override")?.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw == "~" {
+        return Some(home.to_owned());
+    }
+    if let Some(relative) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        return Some(home.join(relative));
+    }
+    Some(PathBuf::from(raw))
+}
+
 fn rename_with_retry(source: &Path, destination: &Path, code: &'static str) -> AppResult<()> {
     #[cfg(windows)]
     {
@@ -690,7 +740,14 @@ fn sync_tree(path: &Path) -> AppResult<()> {
         }
         sync_directory(path)
     } else if metadata.is_file() {
+        // Every file published into the candidate is already synchronized on
+        // its writable creation handle. Reopening it with File::open here is
+        // read-only; FlushFileBuffers requires GENERIC_WRITE on Windows and
+        // otherwise fails deterministically with ERROR_ACCESS_DENIED (5).
+        #[cfg(unix)]
         File::open(path)?.sync_all()?;
+        #[cfg(not(unix))]
+        let _ = path;
         Ok(())
     } else {
         Err(AppError::new("migrationUnsupportedEntry"))
@@ -797,6 +854,24 @@ mod tests {
 
         restore_readonly(&changed).unwrap();
         assert!(fs::metadata(&settings).unwrap().permissions().readonly());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_migration_publishes_a_candidate_containing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        fs::write(paths.dsh_home.join("existing"), b"keep").unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("imported"), b"new").unwrap();
+        let service = MigrationService::isolated(paths.clone(), source, temp.path().join("cc"));
+
+        service.apply().unwrap();
+
+        assert_eq!(fs::read(paths.dsh_home.join("existing")).unwrap(), b"keep");
+        assert_eq!(fs::read(paths.dsh_home.join("imported")).unwrap(), b"new");
     }
 
     #[test]

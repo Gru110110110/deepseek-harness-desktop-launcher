@@ -124,7 +124,7 @@ jobs:
           shared-key: build-${{ matrix.target }}
           cache-on-failure: true
       - run: pnpm install --frozen-lockfile
-      - name: Verify Windows process-tree cleanup
+      - name: Verify Windows-specific regressions
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -137,7 +137,7 @@ jobs:
               -replace '%', '%25' `
               -replace "`r", '%0D' `
               -replace "`n", '%0A'
-            Write-Host "::error title=Windows process-tree cleanup test failed::$detail"
+            Write-Host "::error title=Windows-specific regression test failed::$detail"
             exit $exitCode
           }
       - name: Require the Tauri updater trust root

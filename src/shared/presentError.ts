@@ -1,4 +1,7 @@
-type Translate = (key: string, options?: Record<string, unknown>) => string;
+export type Translate = (
+  key: string,
+  options?: Record<string, unknown>,
+) => string;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

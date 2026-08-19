@@ -594,6 +594,10 @@ a:focus-visible {
   font-size: 10px;
   cursor: pointer;
 }
+.update-banner button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
 .page-actions {
   display: flex;
   gap: 20px;

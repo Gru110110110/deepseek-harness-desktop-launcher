@@ -11,7 +11,7 @@ import type { Language, ThemePreference } from "@/platform/generated/bindings";
 import logoUrl from "../../assets/logo-blue.png";
 import deepseekIconUrl from "../../assets/external/deepseek.png";
 import githubIconUrl from "../../assets/external/github.svg";
-import { presentError } from "@/shared/presentError";
+import { showTimedError } from "@/shared/errorToast";
 import { ThemeProvider } from "./ThemeProvider";
 
 const navigation = features
@@ -72,6 +72,9 @@ function PreferenceMenu({
 function ShellContent() {
   const snapshot = useLauncherSnapshot();
   const { t, i18n } = useTranslation(undefined, { lng: snapshot.language });
+  const presentTimedError = (error: unknown) => {
+    showTimedError(error, (key, values) => t(key, values));
+  };
 
   useEffect(() => {
     if (i18n.language !== snapshot.language)
@@ -83,14 +86,14 @@ function ShellContent() {
     try {
       await launcherApi.setLanguage(value as Language);
     } catch (error) {
-      toast.error(presentError(error, (key, values) => t(key, values)));
+      presentTimedError(error);
     }
   };
   const setTheme = async (value: string) => {
     try {
       await launcherApi.setTheme(value as ThemePreference);
     } catch (error) {
-      toast.error(presentError(error, (key, values) => t(key, values)));
+      presentTimedError(error);
     }
   };
   const checkDesktopUpdate = async () => {
@@ -98,19 +101,28 @@ function ShellContent() {
       const version = await launcherApi.checkDesktopUpdate();
       if (!version) toast.success(t("update.desktop.latest"));
     } catch (error) {
-      toast.error(presentError(error, (key, values) => t(key, values)));
+      presentTimedError(error);
+    }
+  };
+  const checkHarnessUpdate = async () => {
+    try {
+      const version = await launcherApi.checkHarnessUpdate();
+      if (!version) toast.success(t("update.harness.latest"));
+    } catch (error) {
+      presentTimedError(error);
     }
   };
   const desktopUpdateBusy =
     snapshot.desktopUpdate.kind === "checking" ||
     snapshot.desktopUpdate.kind === "downloading" ||
     snapshot.desktopUpdate.kind === "installing";
+  const harnessUpdateBusy =
+    snapshot.harnessUpdate.kind === "checking" ||
+    snapshot.harnessUpdate.kind === "installing";
   const openExternalLink = (target: "github" | "deepseek") => {
-    void launcherApi
-      .openExternalLink(target)
-      .catch((error: unknown) =>
-        toast.error(presentError(error, (key, values) => t(key, values))),
-      );
+    void launcherApi.openExternalLink(target).catch((error: unknown) => {
+      presentTimedError(error);
+    });
   };
 
   return (
@@ -122,13 +134,9 @@ function ShellContent() {
             title={t("links.website")}
             aria-label={t("links.website")}
             onClick={() =>
-              void launcherApi
-                .openWebsite()
-                .catch((error: unknown) =>
-                  toast.error(
-                    presentError(error, (key, values) => t(key, values)),
-                  ),
-                )
+              void launcherApi.openWebsite().catch((error: unknown) => {
+                presentTimedError(error);
+              })
             }
           >
             <img src={logoUrl} alt="" className="brand-logo" />
@@ -224,12 +232,30 @@ function ShellContent() {
                 />
               </span>
             </button>
-            <div className="version-row">
+            <button
+              className="version-row version-action"
+              type="button"
+              disabled={
+                harnessUpdateBusy ||
+                snapshot.phase !== "ready" ||
+                !snapshot.harnessVersion
+              }
+              title={t("action.checkHarnessUpdate")}
+              aria-label={t("action.checkHarnessUpdate")}
+              onClick={() => void checkHarnessUpdate()}
+            >
               <span>HARNESS</span>
               <span>
                 {snapshot.harnessVersion ? `v${snapshot.harnessVersion}` : "—"}
+                <RefreshCw
+                  size={10}
+                  className={
+                    snapshot.harnessUpdate.kind === "checking" ? "spin" : ""
+                  }
+                  aria-hidden
+                />
               </span>
-            </div>
+            </button>
             <div className="theme-symbols" aria-hidden>
               <Sun size={13} />
               <Moon size={13} />

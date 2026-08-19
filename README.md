@@ -14,7 +14,7 @@ The application uses React for presentation, a narrow Tauri command/event adapte
 - Exact `@deepseek-ai/dsh` installation with npm registry fallback
 - Transactional staging, executable smoke checks, atomic publication, startup recovery, and rollback
 - Browser selection, system tray lifecycle, English/Simplified Chinese, and light/dark/system themes
-- Separate Harness updates and cryptographically signed desktop updates
+- Separate Harness updates and cryptographically signed desktop updates; both check automatically, can be checked from their sidebar version rows, and remain independently actionable when both have releases available
 
 Python/PyInstaller releases do not understand Tauri updater artifacts. Existing users install the first Tauri release manually; it immediately reuses the compatible `~/.dsh-desktop` layout. Later releases are checked in the background and shown before any package is downloaded. After the user confirms, the backend performs the signed download, installation, safe Harness shutdown, and restart as one operation.
 
@@ -111,16 +111,16 @@ The checked-in updater public key is intentionally empty: local source builds do
 
 ## Runtime environment overrides
 
-| Variable                     | Meaning                                                                                                                      |
-| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `DSH_DESKTOP_HOME`           | Launcher/runtime home; defaults to `~/.dsh-desktop`                                                                          |
-| `DSH_HOME`                   | Explicit external Harness home; bypasses the isolated desktop `dsh-home` and disables all imports. Set it only deliberately. |
-| `DSH_DESKTOP_SOURCE_HOME`    | Optional source-home import; defaults to `~/.dsh`                                                                            |
-| `DSH_DESKTOP_CC_SWITCH_HOME` | Optional read-only CC Switch source; defaults to `~/.cc-switch`                                                              |
-| `DSH_DESKTOP_NODE_VERSION`   | Exact Node override; requires `DSH_DESKTOP_NODE_SHA256`                                                                      |
-| `DSH_DESKTOP_NODE_SHA256`    | SHA-256 trust root for an overridden Node archive                                                                            |
-| `DSH_DESKTOP_NODE_BASES`     | Comma-separated Node mirrors; explicit values suppress defaults                                                              |
-| `DSH_DESKTOP_NPM_REGISTRIES` | Comma-separated npm registries; explicit values suppress defaults                                                            |
+| Variable                     | Meaning                                                                                                                                                                                   |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DSH_DESKTOP_HOME`           | Launcher/runtime home; defaults to `~/.dsh-desktop`                                                                                                                                       |
+| `DSH_HOME`                   | Explicit external Harness home; bypasses the isolated desktop `dsh-home` and disables all imports. Set it only deliberately.                                                              |
+| `DSH_DESKTOP_SOURCE_HOME`    | Optional source-home import; defaults to `~/.dsh`                                                                                                                                         |
+| `DSH_DESKTOP_CC_SWITCH_HOME` | Optional read-only CC Switch source; defaults to CC Switch's active Windows data directory (including its Store override and legacy `HOME` fallback) or `~/.cc-switch` on other platforms |
+| `DSH_DESKTOP_NODE_VERSION`   | Exact Node override; requires `DSH_DESKTOP_NODE_SHA256`                                                                                                                                   |
+| `DSH_DESKTOP_NODE_SHA256`    | SHA-256 trust root for an overridden Node archive                                                                                                                                         |
+| `DSH_DESKTOP_NODE_BASES`     | Comma-separated Node mirrors; explicit values suppress defaults                                                                                                                           |
+| `DSH_DESKTOP_NPM_REGISTRIES` | Comma-separated npm registries; explicit values suppress defaults                                                                                                                         |
 
 ## License
 
