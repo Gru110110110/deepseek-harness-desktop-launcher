@@ -9,6 +9,7 @@ export type LauncherPhase =
   | "awaitingMigration"
   | "starting"
   | "ready"
+  | "stopped"
   | "failed"
   | "stopping";
 

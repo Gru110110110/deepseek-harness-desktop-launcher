@@ -51,3 +51,7 @@ export const __launcherStoreTest = {
   },
   current: () => current,
 };
+
+export function initializeLauncherPreview(snapshot: LauncherSnapshot): void {
+  accept(snapshot);
+}

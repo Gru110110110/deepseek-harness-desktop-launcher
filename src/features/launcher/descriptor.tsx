@@ -1,5 +1,5 @@
 import { lazy } from "react";
-import { LayoutDashboard } from "lucide-react";
+import { Monitor } from "lucide-react";
 import type { FeatureDescriptor } from "@/app/feature";
 
 const LauncherPage = lazy(async () => {
@@ -11,9 +11,9 @@ export const launcherFeature: FeatureDescriptor = {
   id: "launcher",
   routes: [{ path: "launcher", element: <LauncherPage /> }],
   navigation: {
-    labelKey: "nav.launcher",
+    labelKey: "nav.harness",
     path: "/launcher",
-    icon: LayoutDashboard,
+    icon: Monitor,
     order: 10,
   },
 };

@@ -1186,7 +1186,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut paths = ApplicationPaths::from_home(temp.path().join("desktop"));
         paths.ensure_dirs().unwrap();
-        paths.node_bin = PathBuf::from("/bin/bash");
+        paths.node_bin = temp.path().join("managed-node");
+        fs::copy("/bin/bash", &paths.node_bin).unwrap();
+        fs::set_permissions(&paths.node_bin, fs::Permissions::from_mode(0o700)).unwrap();
         paths.dsh_bin = temp.path().join("managed-dsh");
         let mut script = fs::File::create(&paths.dsh_bin).unwrap();
         writeln!(script, "#!/bin/sh\nwhile :; do sleep 1; done").unwrap();

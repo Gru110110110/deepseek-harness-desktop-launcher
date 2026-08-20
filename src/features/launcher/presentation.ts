@@ -7,52 +7,11 @@ type CopySpec = {
   values?: CopyValues;
 };
 
-type HeaderCopy = {
-  title: CopySpec;
-  detail: CopySpec;
-};
-
 type UpdateNotice = {
-  source: "desktop" | "harness";
   message: CopySpec;
   tone: "info" | "error";
-  action: "checkDesktop" | "installDesktop" | "updateHarness" | null;
-  actionLabel: string | null;
+  actionLabel: string;
 };
-
-export function getHeaderCopy(snapshot: LauncherSnapshot): HeaderCopy {
-  if (snapshot.harnessUpdate.kind === "installing") {
-    const values = { version: snapshot.harnessUpdate.version };
-    return {
-      title: { key: "launcher.updating.title" },
-      detail: { key: "launcher.updating.detail", values },
-    };
-  }
-
-  if (snapshot.migration.kind === "applying") {
-    return {
-      title: { key: "launcher.migrating.title" },
-      detail: { key: "launcher.migrating.detail" },
-    };
-  }
-
-  if (snapshot.phase === "preparing") {
-    return snapshot.harnessVersion
-      ? {
-          title: { key: "launcher.preparing.title" },
-          detail: { key: "launcher.preparing.existingDetail" },
-        }
-      : {
-          title: { key: "launcher.installing.title" },
-          detail: { key: "launcher.installing.detail" },
-        };
-  }
-
-  return {
-    title: { key: `launcher.${snapshot.phase}.title` },
-    detail: { key: `launcher.${snapshot.phase}.detail` },
-  };
-}
 
 export function getServiceCopy(snapshot: LauncherSnapshot): {
   title: string;
@@ -87,104 +46,27 @@ export function getServiceCopy(snapshot: LauncherSnapshot): {
   };
 }
 
-function getDesktopUpdateNotice(
-  snapshot: LauncherSnapshot,
-): UpdateNotice | null {
-  const desktop = snapshot.desktopUpdate;
-  switch (desktop.kind) {
-    case "checking":
-      return {
-        source: "desktop",
-        message: { key: "update.desktop.checking" },
-        tone: "info",
-        action: null,
-        actionLabel: null,
-      };
-    case "available":
-      return {
-        source: "desktop",
-        message: {
-          key: "update.desktop.available",
-          values: { version: desktop.version },
-        },
-        tone: "info",
-        action: "installDesktop",
-        actionLabel: "action.updateDesktop",
-      };
-    case "downloading":
-      return {
-        source: "desktop",
-        message: {
-          key:
-            desktop.total && desktop.total > 0
-              ? "update.desktop.downloading"
-              : "update.desktop.downloadingUnknown",
-          values: {
-            version: desktop.version,
-            percent:
-              desktop.total && desktop.total > 0
-                ? Math.min(
-                    100,
-                    Math.floor((desktop.done * 100) / desktop.total),
-                  )
-                : 0,
-          },
-        },
-        tone: "info",
-        action: null,
-        actionLabel: null,
-      };
-    case "installing":
-      return {
-        source: "desktop",
-        message: {
-          key: "update.desktop.installing",
-          values: { version: desktop.version },
-        },
-        tone: "info",
-        action: null,
-        actionLabel: null,
-      };
-    case "failed":
-      return {
-        source: "desktop",
-        message: { key: "update.desktop.failed" },
-        tone: "error",
-        action: desktop.version ? "installDesktop" : "checkDesktop",
-        actionLabel: desktop.version
-          ? "action.retryUpdate"
-          : "action.retryCheckUpdate",
-      };
-    case "idle":
-      return null;
-  }
-}
-
-function getHarnessUpdateNotice(
+export function getHarnessUpdateNotice(
   snapshot: LauncherSnapshot,
 ): UpdateNotice | null {
   const harness = snapshot.harnessUpdate;
   switch (harness.kind) {
     case "available":
       return {
-        source: "harness",
         message: {
           key: "update.harness.available",
           values: { version: harness.version },
         },
         tone: "info",
-        action: "updateHarness",
         actionLabel: "action.updateHarness",
       };
     case "failed":
       return {
-        source: "harness",
         message: {
           key: "update.harness.failed",
           values: { version: harness.version },
         },
         tone: "error",
-        action: "updateHarness",
         actionLabel: "action.retryUpdate",
       };
     case "installing":
@@ -192,13 +74,4 @@ function getHarnessUpdateNotice(
     case "none":
       return null;
   }
-}
-
-export function getUpdateNotices(snapshot: LauncherSnapshot): UpdateNotice[] {
-  const notices: UpdateNotice[] = [];
-  const desktop = getDesktopUpdateNotice(snapshot);
-  const harness = getHarnessUpdateNotice(snapshot);
-  if (desktop) notices.push(desktop);
-  if (harness) notices.push(harness);
-  return notices;
 }

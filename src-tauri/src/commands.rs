@@ -17,6 +17,22 @@ pub fn launcher_retry(state: State<'_, Arc<AppState>>) {
 }
 
 #[tauri::command]
+pub async fn launcher_stop(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || state.stop_service())
+        .await
+        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+}
+
+#[tauri::command]
+pub async fn launcher_restart(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || state.restart_service())
+        .await
+        .map_err(|error| AppError::new("serviceControlFailed").detail(error.to_string()))?
+}
+
+#[tauri::command]
 pub fn launcher_update_harness(state: State<'_, Arc<AppState>>) {
     state.inner().update_harness();
 }

@@ -34,6 +34,7 @@ use crate::commands;
 
 const WEBSITE: &str = "https://dsdesktop.com/";
 const GITHUB_REPOSITORY: &str = "https://github.com/Gru110110110/deepseek-harness-desktop-launcher";
+const HARNESS_GITHUB_REPOSITORY: &str = "https://github.com/deepseek-ai/deepseek-harness";
 const DEEPSEEK_PLATFORM: &str = "https://platform.deepseek.com/";
 const INSTANCE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const DESKTOP_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -43,6 +44,7 @@ const HARNESS_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 fn external_link_url(target: &str) -> Option<&'static str> {
     match target {
         "github" => Some(GITHUB_REPOSITORY),
+        "harnessGithub" => Some(HARNESS_GITHUB_REPOSITORY),
         "deepseek" => Some(DEEPSEEK_PLATFORM),
         _ => None,
     }
@@ -127,6 +129,73 @@ impl AppState {
 
     pub(crate) fn start(self: &Arc<Self>, force: bool, target_version: Option<String>) {
         self.start_worker(force, target_version, false);
+    }
+
+    pub(crate) fn stop_service(&self) -> AppResult<()> {
+        if !self.mutate_if(|snapshot| {
+            if snapshot.phase != LauncherPhase::Ready {
+                return false;
+            }
+            snapshot.phase = LauncherPhase::Stopping;
+            true
+        }) {
+            return Err(AppError::new("serviceNotReady"));
+        }
+        match self.server.lock().expect("server poisoned").stop() {
+            Ok(()) => {
+                self.mutate(|snapshot| {
+                    snapshot.phase = LauncherPhase::Stopped;
+                    snapshot.web_url = None;
+                    snapshot.service_started_at_ms = None;
+                    snapshot.activity = None;
+                    snapshot.error = None;
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.fail(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn restart_service(&self) -> AppResult<()> {
+        if !self.mutate_if(|snapshot| {
+            if snapshot.phase != LauncherPhase::Ready {
+                return false;
+            }
+            snapshot.phase = LauncherPhase::Starting;
+            snapshot.web_url = None;
+            snapshot.service_started_at_ms = None;
+            snapshot.activity = Some(ActivityState {
+                code: ActivityCode::StartingService,
+                values: Default::default(),
+                started_at_ms: now_ms(),
+            });
+            true
+        }) {
+            return Err(AppError::new("serviceNotReady"));
+        }
+        let restarted = {
+            let mut server = self.server.lock().expect("server poisoned");
+            server.stop().and_then(|()| server.start())
+        };
+        match restarted {
+            Ok(url) => {
+                self.mutate(|snapshot| {
+                    snapshot.phase = LauncherPhase::Ready;
+                    snapshot.web_url = Some(url);
+                    snapshot.service_started_at_ms = Some(now_ms());
+                    snapshot.activity = None;
+                    snapshot.error = None;
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.fail(error.clone());
+                Err(error)
+            }
+        }
     }
 
     fn start_worker(
@@ -266,7 +335,8 @@ impl AppState {
                             code,
                             values,
                             started_at_ms: now_ms(),
-                        })
+                        });
+                        snapshot.progress = ProgressState::Indeterminate;
                     }),
                     DeploymentEvent::Progress { done, total } => state.mutate(|snapshot| {
                         snapshot.progress = total
@@ -381,7 +451,10 @@ impl AppState {
             return Err(AppError::new("harnessUpdateCheckCancelled"));
         }
         let snapshot = self.snapshot();
-        if snapshot.phase != LauncherPhase::Ready {
+        if !matches!(
+            snapshot.phase,
+            LauncherPhase::Ready | LauncherPhase::Stopped
+        ) {
             return Err(AppError::new("serviceNotReady"));
         }
         let _operation = self.begin_harness_update_check()?;
@@ -860,7 +933,11 @@ fn mark_harness_update_checking(
     snapshot: &mut LauncherSnapshot,
     expected: &HarnessUpdateState,
 ) -> bool {
-    if snapshot.phase != LauncherPhase::Ready || &snapshot.harness_update != expected {
+    if !matches!(
+        snapshot.phase,
+        LauncherPhase::Ready | LauncherPhase::Stopped
+    ) || &snapshot.harness_update != expected
+    {
         return false;
     }
     snapshot.harness_update = HarnessUpdateState::Checking;
@@ -1058,6 +1135,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::launcher_get_snapshot,
             commands::launcher_retry,
+            commands::launcher_stop,
+            commands::launcher_restart,
             commands::launcher_check_harness_update,
             commands::launcher_update_harness,
             commands::migration_approve,
@@ -1140,9 +1219,9 @@ mod tests {
     use std::{thread, time::Duration};
 
     use super::{
-        DEEPSEEK_PLATFORM, GITHUB_REPOSITORY, LifecycleDecision, WEBSITE, acquire_instance_lock,
-        acquire_instance_lock_with_timeout, external_link_url, lifecycle_decision,
-        mark_harness_update_checking, replace_harness_update_if_checking,
+        DEEPSEEK_PLATFORM, GITHUB_REPOSITORY, HARNESS_GITHUB_REPOSITORY, LifecycleDecision,
+        WEBSITE, acquire_instance_lock, acquire_instance_lock_with_timeout, external_link_url,
+        lifecycle_decision, mark_harness_update_checking, replace_harness_update_if_checking,
     };
     use dsh_core::{ApplicationPaths, HarnessUpdateState, LauncherSnapshot};
 
@@ -1154,6 +1233,10 @@ mod tests {
     #[test]
     fn external_links_are_limited_to_known_destinations() {
         assert_eq!(external_link_url("github"), Some(GITHUB_REPOSITORY));
+        assert_eq!(
+            external_link_url("harnessGithub"),
+            Some(HARNESS_GITHUB_REPOSITORY)
+        );
         assert_eq!(external_link_url("deepseek"), Some(DEEPSEEK_PLATFORM));
         assert_eq!(external_link_url("unknown"), None);
     }
@@ -1216,6 +1299,18 @@ mod tests {
             snapshot.harness_update,
             HarnessUpdateState::Installing { .. }
         ));
+    }
+
+    #[test]
+    fn a_stopped_service_can_enter_harness_update_checking() {
+        let mut snapshot = LauncherSnapshot::initial("0.2.2");
+        snapshot.phase = dsh_core::LauncherPhase::Stopped;
+
+        assert!(mark_harness_update_checking(
+            &mut snapshot,
+            &HarnessUpdateState::None
+        ));
+        assert_eq!(snapshot.harness_update, HarnessUpdateState::Checking);
     }
 
     #[test]

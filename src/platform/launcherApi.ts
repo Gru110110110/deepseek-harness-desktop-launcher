@@ -14,6 +14,8 @@ const action = (name: string, args?: Record<string, unknown>): Promise<void> =>
 export const launcherApi = {
   snapshot: () => command<LauncherSnapshot>("launcher_get_snapshot"),
   retry: () => action("launcher_retry"),
+  stop: () => action("launcher_stop"),
+  restart: () => action("launcher_restart"),
   checkHarnessUpdate: () =>
     command<string | null>("launcher_check_harness_update"),
   updateHarness: () => action("launcher_update_harness"),
@@ -23,7 +25,7 @@ export const launcherApi = {
     action("launcher_select_browser", { browserId }),
   openWebUi: () => action("launcher_open_web_ui"),
   openWebsite: () => action("application_open_website"),
-  openExternalLink: (target: "github" | "deepseek") =>
+  openExternalLink: (target: "github" | "deepseek" | "harnessGithub") =>
     action("application_open_external_link", { target }),
   copyWebUrl: () => action("application_copy_web_url"),
   setLanguage: (language: Language) =>

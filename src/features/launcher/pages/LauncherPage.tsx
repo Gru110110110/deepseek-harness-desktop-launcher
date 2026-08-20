@@ -1,62 +1,49 @@
 import { useEffect, useMemo } from "react";
 import {
-  Check,
+  Activity,
   ChevronDown,
   Copy,
   ExternalLink,
+  Info,
+  Link2,
   LoaderCircle,
+  Power,
   RefreshCw,
+  RotateCw,
   ShieldCheck,
+  Square,
 } from "lucide-react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
+import deepseekIconUrl from "../../../../assets/external/deepseek.png";
+import githubIconUrl from "../../../../assets/external/github.svg";
 import { launcherApi } from "@/platform/launcherApi";
 import { useLauncherSnapshot } from "@/platform/launcherStore";
+import { showMigrationWarning, showTimedError } from "@/shared/errorToast";
+import { presentError } from "@/shared/presentError";
 import { formatDuration } from "@/shared/time";
 import { useNow } from "@/shared/useNow";
-import { presentError } from "@/shared/presentError";
-import { showMigrationWarning, showTimedError } from "@/shared/errorToast";
-import {
-  getHeaderCopy,
-  getServiceCopy,
-  getUpdateNotices,
-} from "../presentation";
+import { getHarnessUpdateNotice, getServiceCopy } from "../presentation";
 
 export function LauncherPage() {
   const snapshot = useLauncherSnapshot();
   const { t } = useTranslation(undefined, { lng: snapshot.language });
   const now = useNow();
-  const headerCopy = getHeaderCopy(snapshot);
+  const running = snapshot.phase === "ready";
+  const stopped = snapshot.phase === "stopped";
+  const failed = snapshot.phase === "failed";
+  const busy = !running && !stopped && !failed;
   const serviceCopy = getServiceCopy(snapshot);
-  const updateNotices = getUpdateNotices(snapshot);
-  const desktopUpdateBlocked = snapshot.harnessUpdate.kind === "installing";
+  const updateNotice = getHarnessUpdateNotice(snapshot);
   const harnessUpdateBlocked =
-    snapshot.phase !== "ready" ||
+    !running ||
     snapshot.desktopUpdate.kind === "checking" ||
     snapshot.desktopUpdate.kind === "downloading" ||
     snapshot.desktopUpdate.kind === "installing";
   const selectedBrowser = snapshot.browsers.find(
-    (item) => item.id === snapshot.selectedBrowserId,
+    (browser) => browser.id === snapshot.selectedBrowserId,
   );
-  const browserLabel = (id: string, label: string) =>
-    id === "system" ? t("browser.default") : label;
-  const running = snapshot.phase === "ready";
-  const presentTimedError = (error: unknown) => {
-    showTimedError(error, (key, values) => t(key, values));
-  };
-  const migrationPlan =
-    snapshot.migration.kind === "pending" ? snapshot.migration.plan : null;
-  const awaitingMigration = migrationPlan !== null;
-  const migrationWarning = useMemo(() => {
-    if (snapshot.migration.kind !== "completedWithWarning") return null;
-    return presentError(snapshot.migration.warning, (key, values) =>
-      t(key, values),
-    );
-  }, [snapshot.migration, t]);
-  useEffect(() => {
-    if (migrationWarning) showMigrationWarning(migrationWarning);
-  }, [migrationWarning]);
   const elapsed = snapshot.serviceStartedAtMs
     ? formatDuration(now - snapshot.serviceStartedAtMs)
     : null;
@@ -76,43 +63,97 @@ export function LauncherPage() {
           Math.floor((snapshot.progress.done * 100) / snapshot.progress.total),
         )
       : null;
+  const showProgress =
+    busy &&
+    snapshot.activity !== null &&
+    snapshot.phase !== "awaitingMigration";
+  const migrationPlan =
+    snapshot.migration.kind === "pending" ? snapshot.migration.plan : null;
+  const migrationWarning = useMemo(() => {
+    if (snapshot.migration.kind !== "completedWithWarning") return null;
+    return presentError(snapshot.migration.warning, (key, values) =>
+      t(key, values),
+    );
+  }, [snapshot.migration, t]);
 
-  const errorDetail = useMemo(() => {
-    if (!snapshot.error) return null;
-    return presentError(snapshot.error, (key, values) => t(key, values));
-  }, [snapshot.error, t]);
+  useEffect(() => {
+    if (migrationWarning) showMigrationWarning(migrationWarning);
+  }, [migrationWarning]);
 
-  const run = (task: Promise<unknown>): void => {
+  const run = (task: Promise<unknown>) => {
     void task.catch((error: unknown) => {
-      presentTimedError(error);
+      showTimedError(error, (key, values) => t(key, values));
     });
   };
-  const primary = () => {
-    if (running) {
-      run(launcherApi.openWebUi());
-    } else if (snapshot.phase === "failed") {
-      run(launcherApi.retry());
-    }
+  const checkHarnessUpdate = () => {
+    run(
+      launcherApi.checkHarnessUpdate().then((version) => {
+        if (!version) toast.success(t("update.harness.latest"));
+      }),
+    );
   };
+  const browserName =
+    selectedBrowser?.id === "system"
+      ? t("browser.default")
+      : (selectedBrowser?.label ?? t("browser.default"));
 
   return (
-    <section className="launcher-page">
+    <section className="content-page">
       <header className="page-header">
-        <span className="eyebrow">{t("launcher.eyebrow")}</span>
-        <h1>{t(headerCopy.title.key, headerCopy.title.values)}</h1>
-        <p>
-          {snapshot.phase === "failed" && errorDetail
-            ? errorDetail
-            : t(headerCopy.detail.key, headerCopy.detail.values)}
-        </p>
+        <h1>{t("dashboard.title")}</h1>
+        <p>{t("dashboard.subtitle")}</p>
       </header>
 
-      {awaitingMigration && (
-        <div className="migration-card">
-          <div className="migration-icon" aria-hidden>
-            <ShieldCheck size={22} />
+      <div className="panel product-panel">
+        <div className="app-icon-box">
+          <img src={deepseekIconUrl} alt="" />
+        </div>
+        <div className="product-copy">
+          <div className="product-title-line">
+            <h2>DeepSeek Harness</h2>
+            <span
+              className={`status-pill ${running ? "success" : failed ? "danger" : "busy"}`}
+            >
+              {running ? (
+                <span className="status-dot running" />
+              ) : busy ? (
+                <LoaderCircle className="spin" size={13} />
+              ) : null}
+              {running
+                ? t("service.running")
+                : stopped
+                  ? t("service.stopped")
+                  : t(serviceCopy.badge)}
+            </span>
           </div>
-          <div className="migration-copy">
+          <div className="product-version">
+            <span>v{snapshot.harnessVersion ?? "—"}</span>
+            <button
+              type="button"
+              className="inline-action"
+              disabled={
+                (!running && !stopped) ||
+                !snapshot.harnessVersion ||
+                snapshot.harnessUpdate.kind === "checking"
+              }
+              onClick={checkHarnessUpdate}
+            >
+              <RefreshCw
+                size={13}
+                className={
+                  snapshot.harnessUpdate.kind === "checking" ? "spin" : ""
+                }
+              />
+              {t("action.checkUpdate")}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {migrationPlan && (
+        <div className="migration-card">
+          <ShieldCheck size={22} aria-hidden />
+          <div>
             <h2>{t("migration.title")}</h2>
             <p>{t("migration.detail")}</p>
             <ul>
@@ -157,201 +198,241 @@ export function LauncherPage() {
         </div>
       )}
 
-      {!awaitingMigration && (
-        <div className="service-card">
-          <div className="card-heading">
-            <h2>{t(serviceCopy.title)}</h2>
-            <span
-              className={`status-badge ${running ? "success" : snapshot.phase === "failed" ? "error" : "busy"}`}
-            >
-              {running ? (
-                <Check size={14} />
-              ) : snapshot.phase === "failed" ? (
-                "!"
-              ) : (
-                <LoaderCircle size={14} className="spin" />
-              )}
-              {t(serviceCopy.badge)}
-            </span>
-          </div>
-
-          {!running && snapshot.phase !== "failed" && (
-            <div className="progress-block">
-              <div
-                className={`progress-track${progressPercent === null ? " indeterminate" : ""}`}
-              >
-                <span
-                  style={
-                    progressPercent === null
-                      ? undefined
-                      : { width: `${String(progressPercent)}%` }
-                  }
-                />
-              </div>
-              <div className="progress-meta">
-                <span>{activityText}</span>
-                <strong>
-                  {progressPercent === null
-                    ? ""
-                    : `${String(progressPercent)}%`}
-                </strong>
-              </div>
-            </div>
-          )}
-
-          <div className="service-fields">
-            <div>
-              <span>{t("service.address")}</span>
-              <button
-                disabled={!snapshot.webUrl}
-                onClick={() => {
-                  run(
-                    launcherApi.copyWebUrl().then(() => {
-                      toast.success(t("action.copied"));
-                    }),
-                  );
-                }}
-              >
-                {snapshot.webUrl ?? t("service.waitingAddress")}{" "}
-                {snapshot.webUrl && <Copy size={14} />}
-              </button>
-            </div>
-            <div>
-              <span>{t("service.runtime")}</span>
-              <strong>
-                {elapsed
-                  ? t("service.uptime", { time: elapsed })
-                  : running
-                    ? t("service.running")
-                    : snapshot.phase === "failed"
-                      ? t("service.notRunning")
-                      : t("service.waiting")}
-              </strong>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {updateNotices.map((updateNotice) => (
+      {updateNotice && (
         <div
-          key={updateNotice.source}
           className={`update-banner${updateNotice.tone === "error" ? " error" : ""}`}
         >
           <span>
             {t(updateNotice.message.key, updateNotice.message.values)}
           </span>
-          {updateNotice.action === "installDesktop" && (
-            <button
-              disabled={desktopUpdateBlocked}
-              onClick={() => {
-                run(launcherApi.installDesktopUpdate());
-              }}
-            >
-              {t(updateNotice.actionLabel ?? "action.updateDesktop")}
-            </button>
-          )}
-          {updateNotice.action === "checkDesktop" && (
-            <button
-              disabled={desktopUpdateBlocked}
-              onClick={() => {
-                run(launcherApi.checkDesktopUpdate());
-              }}
-            >
-              {t(updateNotice.actionLabel ?? "action.retryCheckUpdate")}
-            </button>
-          )}
-          {updateNotice.action === "updateHarness" && (
-            <button
-              disabled={harnessUpdateBlocked}
-              onClick={() => {
-                run(launcherApi.updateHarness());
-              }}
-            >
-              {t(updateNotice.actionLabel ?? "action.updateHarness")}
-            </button>
-          )}
+          <button
+            disabled={harnessUpdateBlocked}
+            onClick={() => {
+              run(launcherApi.updateHarness());
+            }}
+          >
+            {t(updateNotice.actionLabel)}
+          </button>
         </div>
-      ))}
-
-      {!awaitingMigration && (
-        <footer className="page-actions">
-          <p>
-            {t(snapshot.trayAvailable ? "footer.closeHint" : "footer.noTray")}
-          </p>
-          <div className="split-button">
-            <button
-              className="primary-button"
-              disabled={
-                snapshot.phase === "preparing" ||
-                snapshot.phase === "awaitingMigration" ||
-                snapshot.phase === "starting" ||
-                snapshot.phase === "stopping"
-              }
-              onClick={primary}
-            >
-              {snapshot.phase === "failed" ? (
-                <RefreshCw size={17} />
-              ) : snapshot.phase === "ready" ? (
-                <ExternalLink size={17} />
-              ) : (
-                <LoaderCircle size={17} className="spin" />
-              )}
-              {t(
-                snapshot.phase === "failed"
-                  ? "action.retry"
-                  : snapshot.phase === "ready"
-                    ? snapshot.browsers.length > 1
-                      ? "action.openWith"
-                      : "action.open"
-                    : serviceCopy.busyAction,
-                {
-                  browser: selectedBrowser
-                    ? browserLabel(selectedBrowser.id, selectedBrowser.label)
-                    : t("browser.default"),
-                },
-              )}
-            </button>
-            {snapshot.browsers.length > 1 && (
-              <DropdownMenu.Root>
-                <DropdownMenu.Trigger
-                  className="split-menu"
-                  disabled={!running}
-                  aria-label={t("action.chooseBrowser")}
-                >
-                  <ChevronDown size={18} />
-                </DropdownMenu.Trigger>
-                <DropdownMenu.Portal>
-                  <DropdownMenu.Content
-                    className="dropdown-content"
-                    align="end"
-                    sideOffset={6}
-                  >
-                    <DropdownMenu.RadioGroup
-                      value={snapshot.selectedBrowserId}
-                      onValueChange={(id) => {
-                        run(launcherApi.selectBrowser(id));
-                      }}
-                    >
-                      {snapshot.browsers.map((browser) => (
-                        <DropdownMenu.RadioItem
-                          className="dropdown-item"
-                          value={browser.id}
-                          key={browser.id}
-                        >
-                          <DropdownMenu.ItemIndicator className="dropdown-indicator">
-                            ✓
-                          </DropdownMenu.ItemIndicator>
-                          {browserLabel(browser.id, browser.label)}
-                        </DropdownMenu.RadioItem>
-                      ))}
-                    </DropdownMenu.RadioGroup>
-                  </DropdownMenu.Content>
-                </DropdownMenu.Portal>
-              </DropdownMenu.Root>
-            )}
-          </div>
-        </footer>
       )}
+
+      <section className="page-section">
+        <h2 className="section-label">{t("dashboard.serviceSection")}</h2>
+        <div className="panel rows-panel">
+          <div className="info-row">
+            <Activity className="row-icon" size={18} aria-hidden />
+            <div className="row-copy">
+              <strong>{t("dashboard.runtime")}</strong>
+              <span>
+                {running && elapsed
+                  ? t("dashboard.runtimeDetail", { time: elapsed })
+                  : stopped
+                    ? t("dashboard.stoppedDetail")
+                    : failed && snapshot.error
+                      ? presentError(snapshot.error, (key, values) =>
+                          t(key, values),
+                        )
+                      : (activityText ?? t(serviceCopy.title))}
+              </span>
+              {showProgress && (
+                <div
+                  className="runtime-progress"
+                  role="progressbar"
+                  aria-label={activityText ?? t(serviceCopy.title)}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={progressPercent ?? undefined}
+                >
+                  <div
+                    className={`runtime-progress-track${progressPercent === null ? " indeterminate" : ""}`}
+                  >
+                    <i
+                      style={
+                        progressPercent === null
+                          ? undefined
+                          : { width: `${String(progressPercent)}%` }
+                      }
+                    />
+                  </div>
+                  {progressPercent !== null && (
+                    <small>{String(progressPercent)}%</small>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="row-actions">
+              {running ? (
+                <>
+                  <button
+                    className="outline-button danger"
+                    onClick={() => {
+                      run(launcherApi.stop());
+                    }}
+                  >
+                    <Square size={11} fill="currentColor" />
+                    {t("action.stop")}
+                  </button>
+                  <button
+                    className="outline-button"
+                    onClick={() => {
+                      run(launcherApi.restart());
+                    }}
+                  >
+                    <RotateCw size={14} />
+                    {t("action.restart")}
+                  </button>
+                </>
+              ) : (
+                <button
+                  className="primary-button"
+                  disabled={busy}
+                  onClick={() => {
+                    run(launcherApi.retry());
+                  }}
+                >
+                  {busy ? (
+                    <LoaderCircle className="spin" size={14} />
+                  ) : (
+                    <Power size={14} />
+                  )}
+                  {busy ? t(serviceCopy.busyAction) : t("action.start")}
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="info-row">
+            <Link2 className="row-icon" size={18} aria-hidden />
+            <div className="row-copy">
+              <strong>{t("dashboard.address")}</strong>
+              <span>{t("dashboard.addressDetail")}</span>
+            </div>
+            <div className="address-actions">
+              <span className="service-url">
+                {snapshot.webUrl ?? t("service.waitingAddress")}
+              </span>
+              <button
+                className="icon-button"
+                type="button"
+                disabled={!snapshot.webUrl}
+                aria-label={t("action.copy")}
+                onClick={() => {
+                  run(
+                    launcherApi
+                      .copyWebUrl()
+                      .then(() => toast.success(t("action.copied"))),
+                  );
+                }}
+              >
+                <Copy size={15} />
+              </button>
+              <div className="split-button">
+                <button
+                  className="primary-button open-button"
+                  disabled={!running}
+                  onClick={() => {
+                    run(launcherApi.openWebUi());
+                  }}
+                >
+                  <ExternalLink size={15} />
+                  {t("action.openWith", { browser: browserName })}
+                </button>
+                {snapshot.browsers.length > 1 && (
+                  <DropdownMenu.Root>
+                    <DropdownMenu.Trigger
+                      className="split-menu"
+                      disabled={!running}
+                      aria-label={t("action.chooseBrowser")}
+                    >
+                      <ChevronDown size={16} />
+                    </DropdownMenu.Trigger>
+                    <DropdownMenu.Portal>
+                      <DropdownMenu.Content
+                        className="dropdown-content"
+                        align="end"
+                        sideOffset={6}
+                      >
+                        <DropdownMenu.RadioGroup
+                          value={snapshot.selectedBrowserId}
+                          onValueChange={(id) => {
+                            run(launcherApi.selectBrowser(id));
+                          }}
+                        >
+                          {snapshot.browsers.map((browser) => (
+                            <DropdownMenu.RadioItem
+                              className="dropdown-item"
+                              value={browser.id}
+                              key={browser.id}
+                            >
+                              <DropdownMenu.ItemIndicator className="dropdown-indicator">
+                                ✓
+                              </DropdownMenu.ItemIndicator>
+                              {browser.id === "system"
+                                ? t("browser.default")
+                                : browser.label}
+                            </DropdownMenu.RadioItem>
+                          ))}
+                        </DropdownMenu.RadioGroup>
+                      </DropdownMenu.Content>
+                    </DropdownMenu.Portal>
+                  </DropdownMenu.Root>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section className="page-section resources-section">
+        <h2 className="section-label">{t("dashboard.resourcesSection")}</h2>
+        <div className="panel rows-panel resource-panel">
+          <button
+            className="info-row resource-row"
+            type="button"
+            onClick={() => {
+              run(launcherApi.openExternalLink("deepseek"));
+            }}
+          >
+            <img className="resource-icon" src={deepseekIconUrl} alt="" />
+            <span className="row-copy">
+              <strong>{t("resource.deepseek")}</strong>
+              <span>{t("resource.deepseekDetail")}</span>
+            </span>
+            <span className="resource-target">platform.deepseek.com</span>
+            <span className="icon-button" aria-hidden>
+              <ExternalLink size={14} />
+            </span>
+          </button>
+          <button
+            className="info-row resource-row"
+            type="button"
+            onClick={() => {
+              run(launcherApi.openExternalLink("harnessGithub"));
+            }}
+          >
+            <img
+              className="resource-icon github-icon"
+              src={githubIconUrl}
+              alt=""
+            />
+            <span className="row-copy">
+              <strong>GitHub</strong>
+              <span>{t("resource.harnessGithubDetail")}</span>
+            </span>
+            <span className="resource-target">
+              github.com/deepseek-ai/deepseek-harness
+            </span>
+            <span className="icon-button" aria-hidden>
+              <ExternalLink size={14} />
+            </span>
+          </button>
+        </div>
+      </section>
+
+      <p className="page-footnote">
+        <Info size={15} strokeWidth={1.8} aria-hidden />
+        {t(snapshot.trayAvailable ? "footer.closeHint" : "footer.noTray")}
+      </p>
     </section>
   );
 }

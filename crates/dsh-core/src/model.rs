@@ -38,6 +38,7 @@ pub enum LauncherPhase {
     AwaitingMigration,
     Starting,
     Ready,
+    Stopped,
     Failed,
     Stopping,
 }
