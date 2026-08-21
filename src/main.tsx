@@ -27,7 +27,7 @@ if (import.meta.env.DEV && !isTauri) {
     selectedBrowserId: "chrome",
     language: "zh",
     theme: "system",
-    desktopVersion: "0.3.1",
+    desktopVersion: "0.3.2",
     harnessVersion: "0.1.0-rc.7",
     desktopUpdate: { kind: "idle" },
     harnessUpdate: { kind: "none" },
