@@ -58,7 +58,7 @@
   "activity.verifyingNode": "验证 Node.js {{version}} · {{elapsed}}",
   "activity.checkingSources": "检查安装源 · {{elapsed}}",
   "activity.copyingHarnessRuntime": "复用 Harness {{fromVersion}} 更新到 {{version}}，已复制 {{processed}} 个组件 · {{elapsed}}",
-  "activity.installingHarness": "通过 {{source}} 准备安装 Harness {{version}} · {{elapsed}}",
+  "activity.installingHarness": "准备安装 Harness {{version}}（来源 {{source}}）· {{elapsed}}",
   "activity.resolvingHarnessDependencies": "通过 {{source}} 解析 Harness 依赖，已处理 {{processed}} 项 · {{elapsed}}",
   "activity.downloadingHarnessPackages": "通过 {{source}} 获取依赖包，已处理 {{processed}} 个 · {{elapsed}}",
   "activity.writingHarnessRuntime": "写入 Harness 运行环境，已安装 {{processed}} 个组件 · {{elapsed}}",

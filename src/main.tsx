@@ -8,6 +8,7 @@ import {
   initializeLauncherStore,
 } from "@/platform/launcherStore";
 import type { LauncherSnapshot } from "@/platform/generated/bindings";
+import packageJson from "../package.json";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
 if (import.meta.env.DEV && !isTauri) {
@@ -27,7 +28,7 @@ if (import.meta.env.DEV && !isTauri) {
     selectedBrowserId: "chrome",
     language: "zh",
     theme: "system",
-    desktopVersion: "0.3.2",
+    desktopVersion: packageJson.version,
     harnessVersion: "0.1.0-rc.7",
     desktopUpdate: { kind: "idle" },
     harnessUpdate: { kind: "none" },
