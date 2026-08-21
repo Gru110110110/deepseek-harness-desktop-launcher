@@ -39,6 +39,8 @@ const DEEPSEEK_PLATFORM: &str = "https://platform.deepseek.com/";
 const INSTANCE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const DESKTOP_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
 const DESKTOP_UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS: usize = 3;
+const DESKTOP_UPDATE_RETRY_DELAY: Duration = Duration::from_millis(750);
 const HARNESS_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn external_link_url(target: &str) -> Option<&'static str> {
@@ -658,7 +660,10 @@ impl AppState {
                 }
             })
             .build()
-            .map_err(|error| AppError::new("desktopUpdateFailed").detail(error.to_string()))
+            .map_err(|error| {
+                log::error!("desktop updater configuration is invalid: {error:?}");
+                AppError::new("desktopUpdateConfigurationInvalid")
+            })
     }
 
     pub(crate) async fn check_desktop_update(
@@ -673,7 +678,8 @@ impl AppState {
                 .await
                 .map_err(|_| AppError::new("desktopUpdateCheckTimedOut"))?
                 .map_err(|error| {
-                    AppError::new("desktopUpdateCheckFailed").detail(error.to_string())
+                    log::warn!("desktop update check request failed: {error:?}");
+                    desktop_update_check_error(classify_desktop_update_check_error(&error))
                 })
         }
         .await;
@@ -693,7 +699,6 @@ impl AppState {
                 Ok(None)
             }
             Err(error) => {
-                log::warn!("desktop update check failed: {error}");
                 self.mutate(|snapshot| {
                     snapshot.desktop_update = if report_failure {
                         DesktopUpdateState::Failed { version: None }
@@ -745,12 +750,15 @@ impl AppState {
                 return Err(AppError::new("desktopUpdateNotAvailable"));
             }
             Ok(Err(error)) => {
+                log::warn!("desktop update check before download failed: {error:?}");
                 self.mutate(|snapshot| {
                     snapshot.desktop_update = DesktopUpdateState::Failed {
                         version: previous_version,
                     }
                 });
-                return Err(AppError::new("desktopUpdateCheckFailed").detail(error.to_string()));
+                return Err(desktop_update_check_error(
+                    classify_desktop_update_check_error(&error),
+                ));
             }
         };
 
@@ -758,57 +766,82 @@ impl AppState {
         // release appeared after the prompt, it replaces the stale version
         // instead of trapping the user in a permanent mismatch loop.
         let version = update.version.clone();
-        self.mutate(|snapshot| {
-            snapshot.desktop_update = DesktopUpdateState::Downloading {
-                version: version.clone(),
-                done: 0,
-                total: None,
-            }
-        });
-        let progress_version = version.clone();
-        let weak = Arc::downgrade(self);
-        let downloaded = tokio::time::timeout(
-            DESKTOP_UPDATE_DOWNLOAD_TIMEOUT,
-            update.download(
-                move |chunk, total| {
-                    if let Some(state) = weak.upgrade() {
-                        state.mutate(|snapshot| {
-                            let done = match &snapshot.desktop_update {
-                                DesktopUpdateState::Downloading { done, .. } => *done,
-                                _ => 0,
-                            }
-                            .saturating_add(chunk as u64);
+        let mut attempt = 1;
+        let bytes = loop {
+            self.mutate(|snapshot| {
+                snapshot.desktop_update = DesktopUpdateState::Downloading {
+                    version: version.clone(),
+                    done: 0,
+                    total: None,
+                }
+            });
+            let progress_version = version.clone();
+            let weak = Arc::downgrade(self);
+            let downloaded = tokio::time::timeout(
+                DESKTOP_UPDATE_DOWNLOAD_TIMEOUT,
+                update.download(
+                    move |chunk, total| {
+                        if let Some(state) = weak.upgrade() {
+                            state.mutate(|snapshot| {
+                                let done = match &snapshot.desktop_update {
+                                    DesktopUpdateState::Downloading { done, .. } => *done,
+                                    _ => 0,
+                                }
+                                .saturating_add(chunk as u64);
+                                snapshot.desktop_update = DesktopUpdateState::Downloading {
+                                    version: progress_version.clone(),
+                                    done,
+                                    total,
+                                };
+                            });
+                        }
+                    },
+                    || {},
+                ),
+            )
+            .await;
+            match downloaded {
+                Ok(Ok(bytes)) => break bytes,
+                Ok(Err(error)) => {
+                    let failure = classify_desktop_update_download_error(&error);
+                    if should_retry_desktop_update_download(attempt, failure) {
+                        log::warn!(
+                            "desktop update download attempt {attempt}/{DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS} failed; will retry: {error:?}"
+                        );
+                        self.mutate(|snapshot| {
                             snapshot.desktop_update = DesktopUpdateState::Downloading {
-                                version: progress_version.clone(),
-                                done,
-                                total,
-                            };
+                                version: version.clone(),
+                                done: 0,
+                                total: None,
+                            }
                         });
+                        attempt += 1;
+                        tokio::time::sleep(DESKTOP_UPDATE_RETRY_DELAY).await;
+                        continue;
                     }
-                },
-                || {},
-            ),
-        )
-        .await;
-        let bytes = match downloaded {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(error)) => {
-                log::warn!("desktop update download failed: {error}");
-                self.mutate(|snapshot| {
-                    snapshot.desktop_update = DesktopUpdateState::Failed {
-                        version: Some(version.clone()),
-                    }
-                });
-                return Err(AppError::new("desktopUpdateDownloadFailed").detail(error.to_string()));
-            }
-            Err(_) => {
-                log::warn!("desktop update download timed out");
-                self.mutate(|snapshot| {
-                    snapshot.desktop_update = DesktopUpdateState::Failed {
-                        version: Some(version.clone()),
-                    }
-                });
-                return Err(AppError::new("desktopUpdateDownloadTimedOut"));
+                    log::warn!(
+                        "desktop update download attempt {attempt}/{DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS} failed; giving up: {error:?}"
+                    );
+                    self.mutate(|snapshot| {
+                        snapshot.desktop_update = DesktopUpdateState::Failed {
+                            version: Some(version.clone()),
+                        }
+                    });
+                    return Err(desktop_update_download_error(failure));
+                }
+                Err(_) => {
+                    // One attempt may already have occupied the full 30-minute
+                    // budget, so a timeout is left for an explicit user retry.
+                    log::warn!(
+                        "desktop update download attempt {attempt}/{DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS} timed out; giving up"
+                    );
+                    self.mutate(|snapshot| {
+                        snapshot.desktop_update = DesktopUpdateState::Failed {
+                            version: Some(version.clone()),
+                        }
+                    });
+                    return Err(AppError::new("desktopUpdateDownloadTimedOut"));
+                }
             }
         };
 
@@ -818,13 +851,13 @@ impl AppState {
             }
         });
         if let Err(error) = update.install(bytes) {
-            log::warn!("desktop update install failed: {error}");
+            log::warn!("desktop update install failed: {error:?}");
             self.mutate(|snapshot| {
                 snapshot.desktop_update = DesktopUpdateState::Failed {
                     version: Some(version),
                 }
             });
-            return Err(AppError::new("desktopUpdateFailed").detail(error.to_string()));
+            return Err(AppError::new("desktopUpdateFailed"));
         }
 
         // On Windows Update::install exits the process after invoking the
@@ -949,6 +982,79 @@ fn mark_harness_update_checking(
     }
     snapshot.harness_update = HarnessUpdateState::Checking;
     true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopUpdateCheckFailure {
+    Network,
+    Other,
+}
+
+fn classify_desktop_update_check_error(
+    error: &tauri_plugin_updater::Error,
+) -> DesktopUpdateCheckFailure {
+    match error {
+        tauri_plugin_updater::Error::Reqwest(_) => DesktopUpdateCheckFailure::Network,
+        _ => DesktopUpdateCheckFailure::Other,
+    }
+}
+
+fn desktop_update_check_error(failure: DesktopUpdateCheckFailure) -> AppError {
+    let code = match failure {
+        DesktopUpdateCheckFailure::Network => "desktopUpdateCheckNetworkFailed",
+        DesktopUpdateCheckFailure::Other => "desktopUpdateCheckFailed",
+    };
+    AppError::new(code)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopUpdateDownloadFailure {
+    RetryableNetwork,
+    Trust,
+    Other,
+}
+
+fn classify_desktop_update_download_error(
+    error: &tauri_plugin_updater::Error,
+) -> DesktopUpdateDownloadFailure {
+    use tauri_plugin_updater::Error;
+
+    match error {
+        Error::Reqwest(_) => DesktopUpdateDownloadFailure::RetryableNetwork,
+        Error::Network(message) if retryable_download_http_status(message) => {
+            DesktopUpdateDownloadFailure::RetryableNetwork
+        }
+        Error::Minisign(_) | Error::Base64(_) | Error::SignatureUtf8(_) => {
+            DesktopUpdateDownloadFailure::Trust
+        }
+        _ => DesktopUpdateDownloadFailure::Other,
+    }
+}
+
+fn retryable_download_http_status(message: &str) -> bool {
+    let status = message
+        .strip_prefix("Download request failed with status:")
+        .and_then(|suffix| suffix.split_whitespace().next())
+        .and_then(|status| status.parse::<u16>().ok());
+
+    matches!(status, Some(408 | 429 | 500..=599))
+}
+
+fn should_retry_desktop_update_download(
+    attempt: usize,
+    failure: DesktopUpdateDownloadFailure,
+) -> bool {
+    failure == DesktopUpdateDownloadFailure::RetryableNetwork
+        && attempt < DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS
+}
+
+fn desktop_update_download_error(failure: DesktopUpdateDownloadFailure) -> AppError {
+    let code = match failure {
+        DesktopUpdateDownloadFailure::RetryableNetwork => "desktopUpdateNetworkFailed",
+        DesktopUpdateDownloadFailure::Trust => "desktopUpdateTrustInvalid",
+        DesktopUpdateDownloadFailure::Other => "desktopUpdateDownloadFailed",
+    };
+    AppError::new(code)
 }
 
 fn desktop_update_start_state(version: Option<String>) -> DesktopUpdateState {
@@ -1232,12 +1338,18 @@ mod tests {
     use std::{thread, time::Duration};
 
     use super::{
-        DEEPSEEK_PLATFORM, GITHUB_REPOSITORY, HARNESS_GITHUB_REPOSITORY, LifecycleDecision,
-        WEBSITE, acquire_instance_lock, acquire_instance_lock_with_timeout,
-        desktop_update_start_state, external_link_url, lifecycle_decision,
-        mark_harness_update_checking, replace_harness_update_if_checking,
+        DEEPSEEK_PLATFORM, DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS, DesktopUpdateCheckFailure,
+        DesktopUpdateDownloadFailure, GITHUB_REPOSITORY, HARNESS_GITHUB_REPOSITORY,
+        LifecycleDecision, WEBSITE, acquire_instance_lock, acquire_instance_lock_with_timeout,
+        classify_desktop_update_check_error, classify_desktop_update_download_error,
+        desktop_update_check_error, desktop_update_download_error, desktop_update_start_state,
+        external_link_url, lifecycle_decision, mark_harness_update_checking,
+        replace_harness_update_if_checking, retryable_download_http_status,
+        should_retry_desktop_update_download,
     };
-    use dsh_core::{ApplicationPaths, DesktopUpdateState, HarnessUpdateState, LauncherSnapshot};
+    use dsh_core::{
+        AppError, ApplicationPaths, DesktopUpdateState, HarnessUpdateState, LauncherSnapshot,
+    };
 
     #[test]
     fn product_website_uses_the_public_homepage() {
@@ -1270,6 +1382,87 @@ mod tests {
         assert_eq!(
             desktop_update_start_state(None),
             DesktopUpdateState::Checking
+        );
+    }
+
+    #[test]
+    fn desktop_update_check_errors_distinguish_network_and_other_failures() {
+        let deterministic = tauri_plugin_updater::Error::EmptyEndpoints;
+        assert_eq!(
+            classify_desktop_update_check_error(&deterministic),
+            DesktopUpdateCheckFailure::Other
+        );
+        assert_eq!(
+            desktop_update_check_error(DesktopUpdateCheckFailure::Network),
+            AppError::new("desktopUpdateCheckNetworkFailed")
+        );
+        assert_eq!(
+            desktop_update_check_error(DesktopUpdateCheckFailure::Other),
+            AppError::new("desktopUpdateCheckFailed")
+        );
+    }
+
+    #[test]
+    fn desktop_update_download_retries_only_transient_failures() {
+        for status in [408, 429, 500, 503, 599] {
+            let network = tauri_plugin_updater::Error::Network(format!(
+                "Download request failed with status: {status} response"
+            ));
+            assert_eq!(
+                classify_desktop_update_download_error(&network),
+                DesktopUpdateDownloadFailure::RetryableNetwork
+            );
+        }
+        for status in [400, 401, 403, 404, 600] {
+            let deterministic = tauri_plugin_updater::Error::Network(format!(
+                "Download request failed with status: {status} response"
+            ));
+            assert_eq!(
+                classify_desktop_update_download_error(&deterministic),
+                DesktopUpdateDownloadFailure::Other
+            );
+        }
+        assert!(!retryable_download_http_status("temporary failure"));
+        assert!(!retryable_download_http_status(
+            "Download request failed with status: unknown"
+        ));
+        assert!(should_retry_desktop_update_download(
+            1,
+            DesktopUpdateDownloadFailure::RetryableNetwork
+        ));
+        assert!(should_retry_desktop_update_download(
+            DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS - 1,
+            DesktopUpdateDownloadFailure::RetryableNetwork
+        ));
+        assert!(!should_retry_desktop_update_download(
+            DESKTOP_UPDATE_DOWNLOAD_ATTEMPTS,
+            DesktopUpdateDownloadFailure::RetryableNetwork
+        ));
+        assert!(!should_retry_desktop_update_download(
+            1,
+            DesktopUpdateDownloadFailure::Trust
+        ));
+
+        let deterministic = tauri_plugin_updater::Error::EmptyEndpoints;
+        assert_eq!(
+            classify_desktop_update_download_error(&deterministic),
+            DesktopUpdateDownloadFailure::Other
+        );
+    }
+
+    #[test]
+    fn desktop_update_download_errors_are_stable_and_hide_technical_details() {
+        assert_eq!(
+            desktop_update_download_error(DesktopUpdateDownloadFailure::RetryableNetwork),
+            AppError::new("desktopUpdateNetworkFailed")
+        );
+        assert_eq!(
+            desktop_update_download_error(DesktopUpdateDownloadFailure::Trust),
+            AppError::new("desktopUpdateTrustInvalid")
+        );
+        assert_eq!(
+            desktop_update_download_error(DesktopUpdateDownloadFailure::Other),
+            AppError::new("desktopUpdateDownloadFailed")
         );
     }
 
