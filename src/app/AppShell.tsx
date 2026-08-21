@@ -27,6 +27,7 @@ function ShellContent() {
   const running = snapshot.phase === "ready";
   const desktopUpdateAvailable =
     snapshot.desktopUpdate.kind === "available" ||
+    snapshot.desktopUpdate.kind === "preparing" ||
     snapshot.desktopUpdate.kind === "downloading" ||
     snapshot.desktopUpdate.kind === "installing" ||
     (snapshot.desktopUpdate.kind === "failed" &&

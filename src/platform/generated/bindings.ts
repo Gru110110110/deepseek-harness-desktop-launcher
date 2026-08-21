@@ -50,6 +50,7 @@ export type DesktopUpdateState =
   | { kind: "idle" }
   | { kind: "checking" }
   | { kind: "available"; version: string }
+  | { kind: "preparing"; version: string }
   | { kind: "downloading"; version: string; done: number; total: number | null }
   | { kind: "installing"; version: string }
   | { kind: "failed"; version: string | null };

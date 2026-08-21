@@ -39,6 +39,7 @@ export function LauncherPage() {
   const harnessUpdateBlocked =
     !running ||
     snapshot.desktopUpdate.kind === "checking" ||
+    snapshot.desktopUpdate.kind === "preparing" ||
     snapshot.desktopUpdate.kind === "downloading" ||
     snapshot.desktopUpdate.kind === "installing";
   const selectedBrowser = snapshot.browsers.find(

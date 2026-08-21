@@ -120,7 +120,7 @@ The checked-in updater public key is intentionally empty: local source builds do
 | `DSH_DESKTOP_NODE_VERSION`   | Exact Node override; requires `DSH_DESKTOP_NODE_SHA256`                                                                                                                                   |
 | `DSH_DESKTOP_NODE_SHA256`    | SHA-256 trust root for an overridden Node archive                                                                                                                                         |
 | `DSH_DESKTOP_NODE_BASES`     | Comma-separated Node mirrors; explicit values suppress defaults                                                                                                                           |
-| `DSH_DESKTOP_NPM_REGISTRIES` | Comma-separated npm registries; explicit values suppress defaults                                                                                                                         |
+| `DSH_DESKTOP_NPM_REGISTRIES` | Comma-separated npm registries; the first is the version authority and later entries are exact-version install mirrors; explicit values suppress defaults                                  |
 
 ## License
 

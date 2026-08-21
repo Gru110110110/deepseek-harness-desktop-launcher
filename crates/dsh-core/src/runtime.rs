@@ -120,22 +120,13 @@ pub fn is_runtime_ready(paths: &ApplicationPaths) -> bool {
 }
 
 pub fn latest_harness_version(controller: &DeploymentController) -> AppResult<String> {
+    controller.check()?;
     let client = http_client()?;
     let registries = npm_registries();
-    let mut versions = Vec::new();
-    let mut errors = Vec::new();
-    for registry in registries {
-        controller.check()?;
-        match query_registry_version(&client, &registry) {
-            Ok(version) => versions.push(version),
-            Err(error) => errors.push(format!("{registry}: {error}")),
-        }
-    }
-    versions
-        .into_iter()
-        .max()
-        .map(|version| version.to_string())
-        .ok_or_else(|| AppError::new("versionQueryFailed").detail(errors.join("; ")))
+    let authority = registries
+        .first()
+        .ok_or_else(|| AppError::new("versionQueryFailed").detail("no npm registry configured"))?;
+    query_registry_version(&client, authority).map(|version| version.to_string())
 }
 
 pub fn verify_release_sources() -> AppResult<Vec<String>> {
@@ -180,10 +171,16 @@ pub fn verify_release_sources() -> AppResult<Vec<String>> {
             display_source(base)
         ));
     }
-    for registry in NPM_REGISTRIES {
-        let version = retry_release_source(|| query_registry_version(&client, registry))?;
+    let authority = NPM_REGISTRIES[0];
+    let version = retry_release_source(|| query_registry_version(&client, authority))?;
+    verified.push(format!(
+        "Harness latest {version} via {}",
+        display_source(authority)
+    ));
+    for registry in &NPM_REGISTRIES[1..] {
+        retry_release_source(|| query_registry_exact_version(&client, registry, &version))?;
         verified.push(format!(
-            "Harness latest {version} via {}",
+            "Harness {version} mirror via {}",
             display_source(registry)
         ));
     }
@@ -213,7 +210,7 @@ fn query_registry_version(client: &Client, registry: &str) -> AppResult<Version>
             AppError::new("versionQueryFailed")
                 .detail(format!("{}: {error}", display_source(registry)))
         })?;
-    value
+    let version = value
         .get("version")
         .and_then(Value::as_str)
         .and_then(|raw| Version::parse(raw).ok())
@@ -222,7 +219,40 @@ fn query_registry_version(client: &Client, registry: &str) -> AppResult<Version>
                 "{}: invalid version metadata",
                 display_source(registry)
             ))
-        })
+        })?;
+    query_registry_exact_version(client, registry, &version)?;
+    Ok(version)
+}
+
+fn query_registry_exact_version(
+    client: &Client,
+    registry: &str,
+    expected: &Version,
+) -> AppResult<()> {
+    validate_network_source(registry)?;
+    let url = format!("{registry}/@deepseek-ai%2Fdsh/{expected}");
+    let value = client
+        .get(&url)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .and_then(|response| response.json::<Value>())
+        .map_err(|error| {
+            AppError::new("versionQueryFailed").detail(format!(
+                "{}: Harness {expected} is unavailable: {error}",
+                display_source(registry)
+            ))
+        })?;
+    let actual = value
+        .get("version")
+        .and_then(Value::as_str)
+        .and_then(|raw| Version::parse(raw).ok());
+    if actual.as_ref() != Some(expected) {
+        return Err(AppError::new("versionQueryFailed").detail(format!(
+            "{}: Harness {expected} returned invalid version metadata",
+            display_source(registry)
+        )));
+    }
+    Ok(())
 }
 
 pub fn deploy_runtime(
@@ -377,10 +407,24 @@ fn install_harness(
     let staging = paths
         .runtime_dir
         .join(format!("dsh.staging-{}", Uuid::new_v4()));
+    let client = http_client()?;
+    let expected = Version::parse(version)
+        .map_err(|_| AppError::new("runtimeVersionInvalid").value("version", version))?;
     let registries = npm_registries();
     for registry in registries {
         controller.check()?;
         validate_network_source(&registry)?;
+        // A mirror may advertise a dist-tag before it has synchronized the
+        // corresponding package. Only invoke npm after this exact version is
+        // available from the source; otherwise fail over without a long npm
+        // retry cycle.
+        if let Err(error) = query_registry_exact_version(&client, &registry, &expected) {
+            log::warn!(
+                "skipping Harness {version} source {}: {error}",
+                display_source(&registry)
+            );
+            continue;
+        }
         let _ = remove_owned(&staging);
         fs::create_dir(&staging)?;
         atomic_write(
@@ -1691,6 +1735,36 @@ mod tests {
     }
 
     #[test]
+    fn registry_latest_must_resolve_to_an_existing_exact_version() {
+        let (registry, server) = serve_responses(vec![
+            json_response(r#"{"version":"0.1.1-rc.1"}"#),
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        ]);
+
+        let error = query_registry_version(&http_client().unwrap(), &registry).unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.code, "versionQueryFailed");
+        assert!(
+            error
+                .safe_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("0.1.1-rc.1 is unavailable"))
+        );
+    }
+
+    #[test]
+    fn registry_latest_is_accepted_after_exact_version_confirmation() {
+        let metadata = json_response(r#"{"version":"0.1.0-rc.7"}"#);
+        let (registry, server) = serve_responses(vec![metadata.clone(), metadata]);
+
+        let version = query_registry_version(&http_client().unwrap(), &registry).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(version, Version::parse("0.1.0-rc.7").unwrap());
+    }
+
+    #[test]
     fn failed_publication_can_restore_previous_directory() {
         let temp = tempfile::tempdir().unwrap();
         let active = temp.path().join("runtime");
@@ -1790,5 +1864,27 @@ mod tests {
             handler(stream);
         });
         (format!("http://{address}/archive"), server)
+    }
+
+    fn json_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn serve_responses(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request);
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        (format!("http://{address}"), server)
     }
 }

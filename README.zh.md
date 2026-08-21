@@ -120,7 +120,7 @@ pnpm tauri dev
 | `DSH_DESKTOP_NODE_VERSION`   | 精确 Node 覆盖值；必须同时设置 `DSH_DESKTOP_NODE_SHA256`                                                                           |
 | `DSH_DESKTOP_NODE_SHA256`    | 自定义 Node 归档的 SHA-256 信任根                                                                                                  |
 | `DSH_DESKTOP_NODE_BASES`     | 逗号分隔的 Node 镜像；显式配置会关闭默认回退                                                                                       |
-| `DSH_DESKTOP_NPM_REGISTRIES` | 逗号分隔的 npm registry；显式配置会关闭默认回退                                                                                    |
+| `DSH_DESKTOP_NPM_REGISTRIES` | 逗号分隔的 npm registry；第一个是版本权威源，后续源只作为同一精确版本的安装镜像；显式配置会关闭默认回退                              |
 
 ## 许可
 

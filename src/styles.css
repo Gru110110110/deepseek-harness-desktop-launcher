@@ -644,6 +644,11 @@ button:disabled {
   font-size: 12px;
 }
 
+.desktop-update-button {
+  flex: 0 0 auto;
+  min-width: 132px;
+}
+
 .migration-card {
   display: grid;
   grid-template-columns: auto 1fr;

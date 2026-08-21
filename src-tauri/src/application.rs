@@ -710,7 +710,9 @@ impl AppState {
             } => Some(version),
             _ => None,
         };
-        self.mutate(|snapshot| snapshot.desktop_update = DesktopUpdateState::Checking);
+        self.mutate(|snapshot| {
+            snapshot.desktop_update = desktop_update_start_state(previous_version.clone())
+        });
         let updater = match self.desktop_updater() {
             Ok(updater) => updater,
             Err(error) => {
@@ -942,6 +944,12 @@ fn mark_harness_update_checking(
     }
     snapshot.harness_update = HarnessUpdateState::Checking;
     true
+}
+
+fn desktop_update_start_state(version: Option<String>) -> DesktopUpdateState {
+    version.map_or(DesktopUpdateState::Checking, |version| {
+        DesktopUpdateState::Preparing { version }
+    })
 }
 
 fn replace_harness_update_if_checking(
@@ -1220,10 +1228,11 @@ mod tests {
 
     use super::{
         DEEPSEEK_PLATFORM, GITHUB_REPOSITORY, HARNESS_GITHUB_REPOSITORY, LifecycleDecision,
-        WEBSITE, acquire_instance_lock, acquire_instance_lock_with_timeout, external_link_url,
-        lifecycle_decision, mark_harness_update_checking, replace_harness_update_if_checking,
+        WEBSITE, acquire_instance_lock, acquire_instance_lock_with_timeout,
+        desktop_update_start_state, external_link_url, lifecycle_decision,
+        mark_harness_update_checking, replace_harness_update_if_checking,
     };
-    use dsh_core::{ApplicationPaths, HarnessUpdateState, LauncherSnapshot};
+    use dsh_core::{ApplicationPaths, DesktopUpdateState, HarnessUpdateState, LauncherSnapshot};
 
     #[test]
     fn product_website_uses_the_public_homepage() {
@@ -1239,6 +1248,24 @@ mod tests {
         );
         assert_eq!(external_link_url("deepseek"), Some(DEEPSEEK_PLATFORM));
         assert_eq!(external_link_url("unknown"), None);
+    }
+
+    #[test]
+    fn installing_a_known_desktop_update_preserves_its_target_version() {
+        assert_eq!(
+            desktop_update_start_state(Some("0.3.1".into())),
+            DesktopUpdateState::Preparing {
+                version: "0.3.1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn direct_desktop_install_requests_fall_back_to_checking() {
+        assert_eq!(
+            desktop_update_start_state(None),
+            DesktopUpdateState::Checking
+        );
     }
 
     #[test]

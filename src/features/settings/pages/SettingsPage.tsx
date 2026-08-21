@@ -13,7 +13,10 @@ import { useLauncherSnapshot } from "@/platform/launcherStore";
 import type { Language, ThemePreference } from "@/platform/generated/bindings";
 import { showTimedError } from "@/shared/errorToast";
 import githubIconUrl from "../../../../assets/external/github.svg";
-import { getDesktopUpdateDetail } from "../presentation";
+import {
+  getDesktopUpdateAction,
+  getDesktopUpdateDetail,
+} from "../presentation";
 
 function SegmentedControl<T extends string>({
   value,
@@ -49,15 +52,8 @@ function SegmentedControl<T extends string>({
 export function SettingsPage() {
   const snapshot = useLauncherSnapshot();
   const { t } = useTranslation(undefined, { lng: snapshot.language });
-  const desktopBusy =
-    snapshot.desktopUpdate.kind === "checking" ||
-    snapshot.desktopUpdate.kind === "downloading" ||
-    snapshot.desktopUpdate.kind === "installing";
-  const desktopUpdateReady =
-    snapshot.desktopUpdate.kind === "available" ||
-    (snapshot.desktopUpdate.kind === "failed" &&
-      snapshot.desktopUpdate.version !== null);
   const desktopUpdateDetail = getDesktopUpdateDetail(snapshot.desktopUpdate);
+  const desktopUpdateAction = getDesktopUpdateAction(snapshot.desktopUpdate);
   const run = (task: Promise<unknown>) => {
     void task.catch((error: unknown) => {
       showTimedError(error, (key, values) => t(key, values));
@@ -127,14 +123,19 @@ export function SettingsPage() {
             </div>
             <span className="version-text">v{snapshot.desktopVersion}</span>
             <button
-              className="outline-button"
+              className={`${
+                desktopUpdateAction.appearance === "primary"
+                  ? "primary-button"
+                  : "outline-button"
+              } desktop-update-button`}
               type="button"
-              disabled={desktopBusy}
+              disabled={desktopUpdateAction.disabled}
               onClick={() => {
-                if (desktopUpdateReady) {
+                if (desktopUpdateAction.operation === "install") {
                   run(launcherApi.installDesktopUpdate());
                   return;
                 }
+                if (desktopUpdateAction.operation !== "check") return;
                 run(
                   launcherApi.checkDesktopUpdate().then((version) => {
                     if (!version) toast.success(t("update.desktop.latest"));
@@ -142,11 +143,13 @@ export function SettingsPage() {
                 );
               }}
             >
-              <RefreshCw size={14} className={desktopBusy ? "spin" : ""} />
+              <RefreshCw
+                size={14}
+                className={desktopUpdateAction.spinning ? "spin" : ""}
+              />
               {t(
-                desktopUpdateReady
-                  ? "action.updateDesktop"
-                  : "action.checkUpdate",
+                desktopUpdateAction.label.key,
+                desktopUpdateAction.label.values,
               )}
             </button>
           </div>

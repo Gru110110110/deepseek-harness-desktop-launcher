@@ -130,6 +130,9 @@ pub enum DesktopUpdateState {
     Available {
         version: String,
     },
+    Preparing {
+        version: String,
+    },
     Downloading {
         version: String,
         #[ts(type = "number")]
