@@ -9,14 +9,15 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
+use base64::Engine;
 use fs2::{FileExt, lock_contended_error};
 use reqwest::blocking::Client;
 use semver::Version;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use uuid::Uuid;
 
 use crate::{
@@ -36,6 +37,8 @@ const NPM_REGISTRIES: [&str; 2] = [
 ];
 const MAX_NODE_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_NODE_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_HARNESS_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+const HARNESS_ARCHIVE_DOWNLOAD_ATTEMPTS: usize = 2;
 const NPM_CACHE_PRUNE_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
 const RUNTIME_COPY_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 const NPM_PROCESS_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -210,50 +213,69 @@ fn retry_release_source<T>(mut operation: impl FnMut() -> AppResult<T>) -> AppRe
 }
 
 fn query_registry_version(client: &Client, registry: &str) -> AppResult<Version> {
-    validate_network_source(registry)?;
-    let url = format!("{registry}/@deepseek-ai%2Fdsh/latest");
-    let value = client
-        .get(&url)
-        .send()
-        .and_then(|response| response.error_for_status())
-        .and_then(|response| response.json::<Value>())
-        .map_err(|error| {
-            AppError::new("versionQueryFailed")
-                .detail(format!("{}: {error}", display_source(registry)))
-        })?;
+    let value = query_registry_packument(client, registry)?;
     let version = value
-        .get("version")
+        .get("dist-tags")
+        .and_then(|tags| tags.get("latest"))
         .and_then(Value::as_str)
         .and_then(|raw| Version::parse(raw).ok())
         .ok_or_else(|| {
             AppError::new("versionQueryFailed").detail(format!(
-                "{}: invalid version metadata",
+                "{}: invalid latest version metadata",
                 display_source(registry)
             ))
         })?;
-    query_registry_exact_version(client, registry, &version)?;
+    release_from_packument(registry, &value, &version)?;
     Ok(version)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HarnessInstallSource {
+    registry: String,
+    tarball: String,
+    integrity: String,
 }
 
 fn query_registry_exact_version(
     client: &Client,
     registry: &str,
     expected: &Version,
-) -> AppResult<()> {
+) -> AppResult<HarnessInstallSource> {
+    let value = query_registry_packument(client, registry)?;
+    release_from_packument(registry, &value, expected)
+}
+
+fn query_registry_packument(client: &Client, registry: &str) -> AppResult<Value> {
     validate_network_source(registry)?;
-    let url = format!("{registry}/@deepseek-ai%2Fdsh/{expected}");
-    let value = client
+    let url = format!("{registry}/@deepseek-ai%2Fdsh");
+    client
         .get(&url)
+        .header(reqwest::header::CACHE_CONTROL, "no-cache, no-store")
+        .header(reqwest::header::PRAGMA, "no-cache")
         .send()
         .and_then(|response| response.error_for_status())
         .and_then(|response| response.json::<Value>())
         .map_err(|error| {
+            AppError::new("versionQueryFailed")
+                .detail(format!("{}: {error}", display_source(registry)))
+        })
+}
+
+fn release_from_packument(
+    registry: &str,
+    value: &Value,
+    expected: &Version,
+) -> AppResult<HarnessInstallSource> {
+    let release = value
+        .get("versions")
+        .and_then(|versions| versions.get(expected.to_string()))
+        .ok_or_else(|| {
             AppError::new("versionQueryFailed").detail(format!(
-                "{}: Harness {expected} is unavailable: {error}",
+                "{}: Harness {expected} is absent from the install version index",
                 display_source(registry)
             ))
         })?;
-    let actual = value
+    let actual = release
         .get("version")
         .and_then(Value::as_str)
         .and_then(|raw| Version::parse(raw).ok());
@@ -263,7 +285,50 @@ fn query_registry_exact_version(
             display_source(registry)
         )));
     }
-    Ok(())
+    let distribution = release.get("dist").ok_or_else(|| {
+        AppError::new("versionQueryFailed").detail(format!(
+            "{}: Harness {expected} has no downloadable artifact metadata",
+            display_source(registry)
+        ))
+    })?;
+    let tarball = distribution
+        .get("tarball")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::new("versionQueryFailed").detail(format!(
+                "{}: Harness {expected} has no downloadable artifact",
+                display_source(registry)
+            ))
+        })?;
+    validate_network_source(tarball)?;
+    let integrity = distribution
+        .get("integrity")
+        .and_then(Value::as_str)
+        .and_then(sha512_integrity)
+        .ok_or_else(|| {
+            AppError::new("versionQueryFailed").detail(format!(
+                "{}: Harness {expected} has no supported artifact integrity metadata",
+                display_source(registry)
+            ))
+        })?;
+    Ok(HarnessInstallSource {
+        registry: registry.to_owned(),
+        tarball: tarball.to_owned(),
+        integrity: integrity.to_owned(),
+    })
+}
+
+fn sha512_integrity(value: &str) -> Option<&str> {
+    value
+        .split_ascii_whitespace()
+        .find_map(|entry| entry.strip_prefix("sha512-"))
+        .filter(|digest| {
+            !digest.is_empty()
+                && base64::engine::general_purpose::STANDARD
+                    .decode(digest)
+                    .is_ok_and(|decoded| decoded.len() == 64)
+        })
 }
 
 fn ranked_install_registries(
@@ -271,26 +336,136 @@ fn ranked_install_registries(
     registries: Vec<String>,
     expected: &Version,
     preferred: Option<&str>,
-) -> AppResult<Vec<String>> {
+) -> AppResult<Vec<HarnessInstallSource>> {
     let mut available = Vec::new();
     for (index, registry) in registries.into_iter().enumerate() {
         validate_network_source(&registry)?;
         let started = Instant::now();
         match query_registry_exact_version(client, &registry, expected) {
-            Ok(()) => available.push((started.elapsed(), index, registry)),
+            Ok(source) => available.push((started.elapsed(), index, source)),
             Err(error) => log::warn!(
                 "skipping Harness {expected} source {}: {error}",
                 display_source(&registry)
             ),
         }
     }
-    available.sort_by_key(|(latency, index, registry)| {
-        (preferred != Some(registry.as_str()), *latency, *index)
+    available.sort_by_key(|(latency, index, source)| {
+        (
+            preferred != Some(source.registry.as_str()),
+            *latency,
+            *index,
+        )
     });
-    Ok(available
-        .into_iter()
-        .map(|(_, _, registry)| registry)
-        .collect())
+    Ok(available.into_iter().map(|(_, _, source)| source).collect())
+}
+
+fn download_harness_tarball(
+    client: &Client,
+    source: &HarnessInstallSource,
+    cache_dir: &Path,
+    deadline: Instant,
+    controller: &DeploymentController,
+) -> AppResult<tempfile::TempPath> {
+    controller.check()?;
+    if Instant::now() >= deadline {
+        return Err(AppError::new("downloadTimedOut"));
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let mut response = client
+        .get(&source.tarball)
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .timeout(remaining)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .map_err(|error| {
+            if error.is_timeout() || Instant::now() >= deadline {
+                AppError::new("downloadTimedOut")
+            } else {
+                AppError::new("downloadFailed")
+                    .detail(format!("{}: {error}", display_source(&source.tarball)))
+            }
+        })?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_HARNESS_ARCHIVE_BYTES)
+    {
+        return Err(AppError::new("harnessArchiveTooLarge"));
+    }
+
+    let mut archive = tempfile::Builder::new()
+        .prefix("harness.staging-")
+        .suffix(".tgz")
+        .tempfile_in(cache_dir)?;
+    let mut digest = Sha512::new();
+    let mut downloaded = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        controller.check()?;
+        if Instant::now() >= deadline {
+            return Err(AppError::new("downloadTimedOut"));
+        }
+        let read = response.read(&mut buffer).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut || Instant::now() >= deadline {
+                AppError::new("downloadTimedOut")
+            } else {
+                AppError::io("downloadFailed", &error)
+            }
+        })?;
+        if read == 0 {
+            break;
+        }
+        downloaded = downloaded
+            .checked_add(read as u64)
+            .ok_or_else(|| AppError::new("harnessArchiveTooLarge"))?;
+        if downloaded > MAX_HARNESS_ARCHIVE_BYTES {
+            return Err(AppError::new("harnessArchiveTooLarge"));
+        }
+        archive.write_all(&buffer[..read])?;
+        digest.update(&buffer[..read]);
+    }
+    archive.flush()?;
+    let actual = base64::engine::general_purpose::STANDARD.encode(digest.finalize());
+    if actual != source.integrity {
+        return Err(AppError::new("checksumFailed").detail(format!(
+            "Harness archive from {} did not match its published integrity",
+            display_source(&source.registry)
+        )));
+    }
+    Ok(archive.into_temp_path())
+}
+
+fn download_harness_tarball_with_retries(
+    client: &Client,
+    source: &HarnessInstallSource,
+    cache_dir: &Path,
+    deadline: Instant,
+    controller: &DeploymentController,
+) -> AppResult<tempfile::TempPath> {
+    let mut errors = Vec::new();
+    for attempt in 1..=HARNESS_ARCHIVE_DOWNLOAD_ATTEMPTS {
+        match download_harness_tarball(client, source, cache_dir, deadline, controller) {
+            Ok(archive) => return Ok(archive),
+            Err(error) if error.code == "deploymentCancelled" => return Err(error),
+            Err(error) => {
+                errors.push(format!(
+                    "attempt {attempt}: {}",
+                    error
+                        .safe_detail
+                        .clone()
+                        .unwrap_or_else(|| error.code.clone())
+                ));
+                if Instant::now() >= deadline || error.code == "harnessArchiveTooLarge" {
+                    break;
+                }
+            }
+        }
+    }
+    let code = if Instant::now() >= deadline {
+        "downloadTimedOut"
+    } else {
+        "downloadFailed"
+    };
+    Err(AppError::new(code).detail(errors.join("; ")))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -411,6 +586,7 @@ pub fn deploy_runtime(
     let result = (|| {
         recover_interrupted(paths)?;
         recover_valid_previous(paths)?;
+        prune_stale_harness_archives(&paths.cache_dir)?;
         trim_log_tail(&paths.install_log, INSTALL_LOG_MAX_BYTES)?;
         prune_oversized_npm_cache(paths);
         activity(&notify, ActivityCode::CheckingRuntime, []);
@@ -582,8 +758,45 @@ fn install_harness_into(
         dsh_valid(paths, &paths.node_dir, &paths.dsh_dir, installed)
             && runtime_seed_has_space(paths)
     });
-    for registry in registries {
+    let mut failures = Vec::new();
+    for source in registries {
         controller.check()?;
+        activity(
+            notify,
+            ActivityCode::DownloadingHarnessPackages,
+            [
+                ("version", version.to_owned()),
+                ("source", display_source(&source.registry)),
+                ("processed", "0".to_owned()),
+            ],
+        );
+        let download_deadline = Instant::now()
+            + Duration::from_secs(env_seconds("DSH_DESKTOP_DOWNLOAD_TIMEOUT_SECONDS", 600));
+        let archive = match download_harness_tarball_with_retries(
+            &client,
+            &source,
+            &paths.cache_dir,
+            download_deadline,
+            controller,
+        ) {
+            Ok(archive) => archive,
+            Err(error) if error.code == "deploymentCancelled" => return Err(error),
+            Err(error) => {
+                failures.push(format!(
+                    "{}: {}",
+                    display_source(&source.registry),
+                    error
+                        .safe_detail
+                        .clone()
+                        .unwrap_or_else(|| error.code.clone())
+                ));
+                log::warn!(
+                    "skipping Harness {version} artifact from {}: {error}",
+                    display_source(&source.registry)
+                );
+                continue;
+            }
+        };
         prepare_harness_staging(
             paths,
             staging,
@@ -597,7 +810,7 @@ fn install_harness_into(
             ActivityCode::InstallingHarness,
             [
                 ("version", version.to_owned()),
-                ("source", display_source(&registry)),
+                ("source", display_source(&source.registry)),
             ],
         );
         let npm = npm_cli(&paths.node_dir);
@@ -605,8 +818,9 @@ fn install_harness_into(
         command
             .arg(npm)
             .arg("install")
-            .arg(format!("@deepseek-ai/dsh@{version}"))
+            .arg(&archive)
             .args([
+                "--no-save",
                 "--ignore-scripts",
                 "--no-audit",
                 "--no-fund",
@@ -622,10 +836,10 @@ fn install_harness_into(
         command.arg("--loglevel=silly");
         isolated_command(&mut command, paths);
         command
-            .env("NPM_CONFIG_REGISTRY", &registry)
+            .env("NPM_CONFIG_REGISTRY", &source.registry)
             .current_dir(staging);
         ensure_npm_cache(paths)?;
-        let mut npm_activity = NpmInstallActivity::new(version, &registry);
+        let mut npm_activity = NpmInstallActivity::new(version, &source.registry);
         let install_result = run_logged(
             &mut command,
             &paths.install_log,
@@ -646,22 +860,46 @@ fn install_harness_into(
                 if dsh_valid(paths, &paths.node_dir, staging, version) {
                     if let Err(error) = atomic_write(
                         &paths.cache_dir.join("npm.registry"),
-                        format!("{registry}\n").as_bytes(),
+                        format!("{}\n", source.registry).as_bytes(),
                     ) {
                         log::warn!("preferred npm registry could not be saved: {error}");
                     }
                     return Ok(staging.to_owned());
                 }
+                failures.push(format!(
+                    "{}: runtimeValidationFailed",
+                    display_source(&source.registry)
+                ));
             }
             Err(error) if error.code == "deploymentCancelled" => return Err(error),
             // Registry fallback helps transport failures, but it cannot make
             // npm's local peer-dependency solver faster. Do not repeat a full
             // 30-minute resolution timeout against an equivalent source.
-            Err(error) if error.code == "processTimeout" => break,
-            Err(_) => {}
+            Err(error) if error.code == "processTimeout" => {
+                failures.push(format!(
+                    "{}: {}",
+                    display_source(&source.registry),
+                    error.code
+                ));
+                break;
+            }
+            Err(error) => failures.push(format!(
+                "{}: {}",
+                display_source(&source.registry),
+                error
+                    .safe_detail
+                    .clone()
+                    .unwrap_or_else(|| error.code.clone())
+            )),
         }
     }
-    Err(AppError::new("installFailed").value("log", paths.install_log.display()))
+    Err(AppError::new("installFailed")
+        .value("log", paths.install_log.display())
+        .detail(if failures.is_empty() {
+            "no install source was available".to_owned()
+        } else {
+            failures.join("; ")
+        }))
 }
 
 fn cleanup_failed_staging(staging: &Path, controller: &DeploymentController) -> AppResult<()> {
@@ -712,6 +950,7 @@ fn prepare_harness_staging(
     notify: &impl Fn(DeploymentEvent),
 ) -> AppResult<()> {
     remove_owned(staging)?;
+    let mut reused = false;
     if let Some(seed_version) = seed_version {
         activity(
             notify,
@@ -735,7 +974,7 @@ fn prepare_harness_staging(
                 log::info!(
                     "copied {processed} entries from Harness {seed_version} into the update candidate"
                 );
-                return Ok(());
+                reused = true;
             }
             Err(error) if error.code == "deploymentCancelled" => return Err(error),
             Err(error) => {
@@ -747,11 +986,21 @@ fn prepare_harness_staging(
         }
     }
 
-    fs::create_dir(staging)?;
-    atomic_write(
-        &staging.join("package.json"),
-        b"{\"name\":\"dsh-runtime\",\"private\":true}\n",
-    )
+    if !reused {
+        fs::create_dir(staging)?;
+    }
+    write_harness_manifest(staging, target_version)
+}
+
+fn write_harness_manifest(staging: &Path, target_version: &str) -> AppResult<()> {
+    let manifest = serde_json::to_vec_pretty(&serde_json::json!({
+        "name": "dsh-runtime",
+        "private": true,
+        "dependencies": {
+            "@deepseek-ai/dsh": target_version,
+        },
+    }))?;
+    atomic_write(&staging.join("package.json"), &manifest)
 }
 
 fn copy_runtime_candidate(
@@ -778,12 +1027,12 @@ fn copy_runtime_candidate(
     )
     .and_then(|()| {
         if hidden_lock.exists() && !hidden_lock.is_symlink() {
-            copy_runtime_file(
-                &hidden_lock,
-                &destination.join("node_modules/.package-lock.json"),
-                &mut copied,
-                &mut progress,
-            )?;
+            let copied_lock = destination.join("node_modules/.package-lock.json");
+            copy_runtime_file(&hidden_lock, &copied_lock, &mut copied, &mut progress)?;
+            File::options()
+                .write(true)
+                .open(&copied_lock)?
+                .set_modified(SystemTime::now())?;
         }
         fs::set_permissions(destination, source_metadata.permissions())?;
         progress(copied);
@@ -1303,6 +1552,17 @@ fn prune_old_node_archives(cache_dir: &Path, keep: &str) -> AppResult<()> {
                 || name.ends_with(".gzpart")
                 || name.ends_with(".zippart"));
         if node_archive && name != keep {
+            remove_owned(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn prune_stale_harness_archives(cache_dir: &Path) -> AppResult<()> {
+    for entry in fs::read_dir(cache_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("harness.staging-") && name.ends_with(".tgz") {
             remove_owned(&entry.path())?;
         }
     }
@@ -2291,11 +2551,11 @@ mod tests {
     }
 
     #[test]
-    fn registry_latest_must_resolve_to_an_existing_exact_version() {
-        let (registry, server) = serve_responses(vec![
-            json_response(r#"{"version":"0.1.1-rc.1"}"#),
-            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
-        ]);
+    fn registry_latest_must_exist_in_the_full_install_index() {
+        let stale = json_response(
+            r#"{"dist-tags":{"latest":"0.1.1-rc.2"},"versions":{"0.1.1-rc.1":{"version":"0.1.1-rc.1","dist":{"tarball":"https://registry.example.test/dsh-0.1.1-rc.1.tgz","integrity":"sha512-test"}}}}"#,
+        );
+        let (registry, server) = serve_responses(vec![stale]);
 
         let error = query_registry_version(&http_client().unwrap(), &registry).unwrap_err();
         server.join().unwrap();
@@ -2305,14 +2565,14 @@ mod tests {
             error
                 .safe_detail
                 .as_deref()
-                .is_some_and(|detail| detail.contains("0.1.1-rc.1 is unavailable"))
+                .is_some_and(|detail| detail.contains("absent from the install version index"))
         );
     }
 
     #[test]
-    fn registry_latest_is_accepted_after_exact_version_confirmation() {
-        let metadata = json_response(r#"{"version":"0.1.0-rc.7"}"#);
-        let (registry, server) = serve_responses(vec![metadata.clone(), metadata]);
+    fn registry_latest_is_accepted_from_the_full_install_index() {
+        let metadata = harness_packument("0.1.0-rc.7");
+        let (registry, server) = serve_responses(vec![metadata]);
 
         let version = query_registry_version(&http_client().unwrap(), &registry).unwrap();
         server.join().unwrap();
@@ -2321,8 +2581,132 @@ mod tests {
     }
 
     #[test]
+    fn harness_tarball_must_match_the_published_integrity() {
+        let body = b"verified-harness-archive";
+        let integrity = base64::engine::general_purpose::STANDARD.encode(Sha512::digest(body));
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let (tarball, server) = serve_responses(vec![response]);
+        let source = HarnessInstallSource {
+            registry: tarball.clone(),
+            tarball,
+            integrity,
+        };
+        let temp = tempfile::tempdir().unwrap();
+
+        let archive = download_harness_tarball(
+            &http_client().unwrap(),
+            &source,
+            temp.path(),
+            Instant::now() + Duration::from_secs(2),
+            &DeploymentController::default(),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(fs::read(&archive).unwrap(), body);
+        assert_eq!(
+            archive.extension().and_then(|value| value.to_str()),
+            Some("tgz")
+        );
+    }
+
+    #[test]
+    fn corrupted_harness_tarball_is_rejected_and_removed() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncorrupt";
+        let (tarball, server) = serve_responses(vec![response.into()]);
+        let source = HarnessInstallSource {
+            registry: tarball.clone(),
+            tarball,
+            integrity: base64::engine::general_purpose::STANDARD.encode([0_u8; 64]),
+        };
+        let temp = tempfile::tempdir().unwrap();
+
+        let error = download_harness_tarball(
+            &http_client().unwrap(),
+            &source,
+            temp.path(),
+            Instant::now() + Duration::from_secs(2),
+            &DeploymentController::default(),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.code, "checksumFailed");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn harness_tarball_download_retries_transient_failures() {
+        let body = b"verified-after-retry";
+        let integrity = base64::engine::general_purpose::STANDARD.encode(Sha512::digest(body));
+        let success = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let (tarball, server) = serve_responses(vec![
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into(),
+            success,
+        ]);
+        let source = HarnessInstallSource {
+            registry: tarball.clone(),
+            tarball,
+            integrity,
+        };
+        let temp = tempfile::tempdir().unwrap();
+
+        let archive = download_harness_tarball_with_retries(
+            &http_client().unwrap(),
+            &source,
+            temp.path(),
+            Instant::now() + Duration::from_secs(2),
+            &DeploymentController::default(),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(fs::read(archive).unwrap(), body);
+    }
+
+    #[test]
+    fn harness_tarball_download_uses_its_explicit_deadline() {
+        let (tarball, server) = serve_once(|mut stream| {
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2048\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(&[1_u8; 1024]);
+            let _ = stream.flush();
+            thread::sleep(Duration::from_millis(100));
+            let _ = stream.write_all(&[1_u8; 1024]);
+        });
+        let source = HarnessInstallSource {
+            registry: tarball.clone(),
+            tarball,
+            integrity: base64::engine::general_purpose::STANDARD.encode([0_u8; 64]),
+        };
+        let temp = tempfile::tempdir().unwrap();
+
+        let error = download_harness_tarball(
+            &http_client().unwrap(),
+            &source,
+            temp.path(),
+            Instant::now() + Duration::from_millis(20),
+            &DeploymentController::default(),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.code, "downloadTimedOut");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn exact_install_sources_are_ranked_by_observed_latency() {
-        let metadata = json_response(r#"{"version":"0.1.0-rc.7"}"#);
+        let metadata = harness_packument("0.1.0-rc.7");
         let slow_response = metadata.clone();
         let (slow, slow_server) = serve_once(move |mut stream| {
             let mut request = [0_u8; 2048];
@@ -2346,12 +2730,18 @@ mod tests {
         slow_server.join().unwrap();
         fast_server.join().unwrap();
 
-        assert_eq!(ranked, vec![fast, slow]);
+        assert_eq!(
+            ranked
+                .into_iter()
+                .map(|source| source.registry)
+                .collect::<Vec<_>>(),
+            vec![fast, slow]
+        );
     }
 
     #[test]
     fn last_successful_install_source_is_kept_for_cache_reuse() {
-        let metadata = json_response(r#"{"version":"0.1.0-rc.7"}"#);
+        let metadata = harness_packument("0.1.0-rc.7");
         let slow_response = metadata.clone();
         let (slow, slow_server) = serve_once(move |mut stream| {
             let mut request = [0_u8; 2048];
@@ -2375,7 +2765,13 @@ mod tests {
         slow_server.join().unwrap();
         fast_server.join().unwrap();
 
-        assert_eq!(ranked, vec![slow, fast]);
+        assert_eq!(
+            ranked
+                .into_iter()
+                .map(|source| source.registry)
+                .collect::<Vec<_>>(),
+            vec![slow, fast]
+        );
     }
 
     #[test]
@@ -2455,12 +2851,50 @@ mod tests {
             fs::read(destination.join("node_modules/.package-lock.json")).unwrap(),
             b"{\"lockfileVersion\":3}\n"
         );
+        let lock_modified = fs::metadata(destination.join("node_modules/.package-lock.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        for directory in [
+            destination.join("node_modules"),
+            destination.join("node_modules/example"),
+        ] {
+            assert!(lock_modified >= fs::metadata(directory).unwrap().modified().unwrap());
+        }
         fs::write(destination.join("node_modules/example/value"), b"candidate").unwrap();
         assert_eq!(
             fs::read(source.join("node_modules/example/value")).unwrap(),
             b"active"
         );
         assert_eq!(progress.borrow().last().copied(), Some(copied));
+    }
+
+    #[test]
+    fn reused_runtime_manifest_tracks_the_requested_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        fs::create_dir_all(paths.dsh_dir.join("node_modules/example")).unwrap();
+        fs::write(
+            paths.dsh_dir.join("package.json"),
+            br#"{"name":"dsh-runtime","private":true,"dependencies":{"@deepseek-ai/dsh":"0.1.1-rc.1"}}"#,
+        )
+        .unwrap();
+        let staging = paths.runtime_dir.join("dsh.staging-test");
+
+        prepare_harness_staging(
+            &paths,
+            &staging,
+            Some("0.1.1-rc.1"),
+            "0.1.1-rc.2",
+            &DeploymentController::default(),
+            &|_| {},
+        )
+        .unwrap();
+
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(staging.join("package.json")).unwrap()).unwrap();
+        assert_eq!(manifest["dependencies"]["@deepseek-ai/dsh"], "0.1.1-rc.2");
     }
 
     #[test]
@@ -2566,10 +3000,9 @@ mod tests {
 
         assert_eq!(fs::read(outside.join("keep")).unwrap(), b"user-data");
         assert!(!staging.join("node_modules/external").exists());
-        assert_eq!(
-            fs::read(staging.join("package.json")).unwrap(),
-            b"{\"name\":\"dsh-runtime\",\"private\":true}\n"
-        );
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(staging.join("package.json")).unwrap()).unwrap();
+        assert_eq!(manifest["dependencies"]["@deepseek-ai/dsh"], "0.1.1-rc.1");
     }
 
     #[cfg(unix)]
@@ -2750,6 +3183,19 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_harness_tarball_is_pruned_before_the_next_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path();
+        fs::write(cache.join("harness.staging-abcd.tgz"), b"partial").unwrap();
+        fs::write(cache.join("harness-release.tgz"), b"unrelated").unwrap();
+
+        prune_stale_harness_archives(cache).unwrap();
+
+        assert!(!cache.join("harness.staging-abcd.tgz").exists());
+        assert!(cache.join("harness-release.tgz").exists());
+    }
+
+    #[test]
     fn runtime_copy_requires_space_for_the_copy_and_install_reserve() {
         let source = 256 * 1024 * 1024;
         let required = source + RUNTIME_COPY_RESERVE_BYTES;
@@ -2891,6 +3337,28 @@ mod tests {
         format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
+        )
+    }
+
+    fn harness_packument(version: &str) -> String {
+        let integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode([0_u8; 64])
+        );
+        json_response(
+            &serde_json::json!({
+                "dist-tags": { "latest": version },
+                "versions": {
+                    version: {
+                        "version": version,
+                        "dist": {
+                            "tarball": format!("https://registry.example.test/dsh-{version}.tgz"),
+                            "integrity": integrity,
+                        },
+                    },
+                },
+            })
+            .to_string(),
         )
     }
 

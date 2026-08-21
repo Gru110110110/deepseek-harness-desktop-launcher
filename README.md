@@ -11,8 +11,8 @@ The application uses React for presentation, a narrow Tauri command/event adapte
 - macOS arm64 and x64 DMG installers
 - Windows x64 per-user NSIS installer; no portable ZIP distribution
 - Pinned Node.js 24.19.0 archives admitted only by platform-specific SHA-256
-- Exact `@deepseek-ai/dsh` installation; the first npm registry remains the version authority, the first install prefers the fastest source confirmed to carry that version, and later installs keep the successful source for cache reuse
-- Transactional staging seeded from a valid installed Harness runtime when available and sufficient free space remains, executable smoke checks, atomic publication, startup recovery, and rollback; seed-copy failures fall back to a clean candidate without changing the active runtime
+- Exact `@deepseek-ai/dsh` installation; the first npm registry remains the version authority, availability is confirmed from the same complete version index used by npm, installation uses that release's verified tarball instead of a potentially stale package lookup, and later installs keep the successful source for cache reuse
+- Transactional staging seeded from a valid installed Harness runtime when available and sufficient free space remains; the copied hidden lockfile is refreshed for npm reuse before executable smoke checks, atomic publication, startup recovery, and rollback, while seed-copy failures fall back to a clean candidate without changing the active runtime
 - Live Harness installation phases for dependency resolution, package fetching, runtime writes, validation, and activation; prolonged npm silence explains that dependency calculation may still be active instead of treating missing log output as proof of a stall
 - Browser selection, system tray lifecycle, English/Simplified Chinese, and light/dark/system themes
 - Separate Harness updates and cryptographically signed desktop updates; both check automatically, can be checked from their sidebar version rows, and remain independently actionable when both have releases available

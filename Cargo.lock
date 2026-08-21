@@ -785,6 +785,7 @@ dependencies = [
 name = "dsh-core"
 version = "0.3.2"
 dependencies = [
+ "base64 0.22.1",
  "dirs",
  "flate2",
  "fs2",

@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64.workspace = true
 dirs.workspace = true
 fs2.workspace = true
 flate2.workspace = true
