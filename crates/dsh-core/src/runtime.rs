@@ -42,6 +42,7 @@ const HARNESS_ARCHIVE_DOWNLOAD_ATTEMPTS: usize = 2;
 const NPM_CACHE_PRUNE_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
 const RUNTIME_COPY_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 const NPM_PROCESS_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const NPM_FALLBACK_PROCESS_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const NPM_WAITING_AFTER: Duration = Duration::from_secs(30);
 const RELEASE_SOURCE_ATTEMPTS: usize = 3;
 const RELEASE_NODE_ASSETS: [(&str, &str); 3] = [
@@ -137,10 +138,38 @@ pub fn latest_harness_version(controller: &DeploymentController) -> AppResult<St
     controller.check()?;
     let client = http_client()?;
     let registries = npm_registries();
-    let authority = registries
-        .first()
-        .ok_or_else(|| AppError::new("versionQueryFailed").detail("no npm registry configured"))?;
-    query_registry_version(&client, authority).map(|version| version.to_string())
+    // Probe every registry instead of trusting the first one: a blocked or
+    // stale authority must not hide a newer release available on a mirror,
+    // and the newest observed latest version wins.
+    let mut latest = None;
+    let mut failures = Vec::new();
+    for registry in registries {
+        controller.check()?;
+        match query_registry_version(&client, &registry) {
+            Ok(version) => {
+                latest = Some(match latest {
+                    Some(current) if current >= version => current,
+                    _ => version,
+                });
+            }
+            Err(error) => failures.push(format!(
+                "{}: {}",
+                display_source(&registry),
+                error
+                    .safe_detail
+                    .clone()
+                    .unwrap_or_else(|| error.code.clone())
+            )),
+        }
+    }
+    latest.map(|version| version.to_string()).ok_or_else(|| {
+        let detail = if failures.is_empty() {
+            "no npm registry configured".to_owned()
+        } else {
+            failures.join("; ")
+        };
+        AppError::new("versionQueryFailed").detail(detail)
+    })
 }
 
 pub fn verify_release_sources() -> AppResult<Vec<String>> {
@@ -339,7 +368,13 @@ fn ranked_install_registries(
 ) -> AppResult<Vec<HarnessInstallSource>> {
     let mut available = Vec::new();
     for (index, registry) in registries.into_iter().enumerate() {
-        validate_network_source(&registry)?;
+        if let Err(error) = validate_network_source(&registry) {
+            log::warn!(
+                "skipping invalid Harness {expected} source {}: {error}",
+                display_source(&registry)
+            );
+            continue;
+        }
         let started = Instant::now();
         match query_registry_exact_version(client, &registry, expected) {
             Ok(source) => available.push((started.elapsed(), index, source)),
@@ -365,6 +400,7 @@ fn download_harness_tarball(
     cache_dir: &Path,
     deadline: Instant,
     controller: &DeploymentController,
+    notify: &impl Fn(DeploymentEvent),
 ) -> AppResult<tempfile::TempPath> {
     controller.check()?;
     if Instant::now() >= deadline {
@@ -396,6 +432,7 @@ fn download_harness_tarball(
         .prefix("harness.staging-")
         .suffix(".tgz")
         .tempfile_in(cache_dir)?;
+    let total = response.content_length();
     let mut digest = Sha512::new();
     let mut downloaded = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
@@ -422,6 +459,10 @@ fn download_harness_tarball(
         }
         archive.write_all(&buffer[..read])?;
         digest.update(&buffer[..read]);
+        notify(DeploymentEvent::Progress {
+            done: downloaded,
+            total,
+        });
     }
     archive.flush()?;
     let actual = base64::engine::general_purpose::STANDARD.encode(digest.finalize());
@@ -440,10 +481,11 @@ fn download_harness_tarball_with_retries(
     cache_dir: &Path,
     deadline: Instant,
     controller: &DeploymentController,
+    notify: &impl Fn(DeploymentEvent),
 ) -> AppResult<tempfile::TempPath> {
     let mut errors = Vec::new();
     for attempt in 1..=HARNESS_ARCHIVE_DOWNLOAD_ATTEMPTS {
-        match download_harness_tarball(client, source, cache_dir, deadline, controller) {
+        match download_harness_tarball(client, source, cache_dir, deadline, controller, notify) {
             Ok(archive) => return Ok(archive),
             Err(error) if error.code == "deploymentCancelled" => return Err(error),
             Err(error) => {
@@ -721,10 +763,13 @@ fn install_harness(
         .runtime_dir
         .join(format!("dsh.staging-{}", Uuid::new_v4()));
     let result = install_harness_into(paths, &staging, version, controller, notify);
-    if result.is_err()
-        && let Err(error) = cleanup_failed_staging(&staging, controller)
+    if let Err(install_error) = &result
+        && let Err(cleanup_error) = cleanup_failed_staging(&staging, controller)
     {
-        return Err(error);
+        log::error!(
+            "Harness install failed: {install_error}; the failed staging directory could not be removed either: {cleanup_error}"
+        );
+        return Err(cleanup_error);
     }
     if controller.cleanup_error().is_none() {
         prune_oversized_npm_cache(paths);
@@ -759,6 +804,8 @@ fn install_harness_into(
             && runtime_seed_has_space(paths)
     });
     let mut failures = Vec::new();
+    let mut npm_total = NPM_PROCESS_TOTAL_TIMEOUT;
+    let mut timed_out_once = false;
     for source in registries {
         controller.check()?;
         activity(
@@ -778,6 +825,7 @@ fn install_harness_into(
             &paths.cache_dir,
             download_deadline,
             controller,
+            notify,
         ) {
             Ok(archive) => archive,
             Err(error) if error.code == "deploymentCancelled" => return Err(error),
@@ -813,39 +861,13 @@ fn install_harness_into(
                 ("source", display_source(&source.registry)),
             ],
         );
-        let npm = npm_cli(&paths.node_dir);
-        let mut command = Command::new(&paths.node_bin);
-        command
-            .arg(npm)
-            .arg("install")
-            .arg(&archive)
-            .args([
-                "--no-save",
-                "--ignore-scripts",
-                "--no-audit",
-                "--no-fund",
-                "--package-lock=false",
-                "--prefer-offline",
-                "--fetch-retries=2",
-                "--fetch-retry-factor=2",
-                "--fetch-retry-mintimeout=1000",
-                "--fetch-retry-maxtimeout=10000",
-                "--fetch-timeout=60000",
-            ])
-            .arg(format!("--cache={}", paths.cache_dir.join("npm").display()));
-        command.arg("--loglevel=silly");
-        isolated_command(&mut command, paths);
-        command
-            .env("NPM_CONFIG_REGISTRY", &source.registry)
-            .current_dir(staging);
+        let mut command = harness_npm_install_command(paths, &archive, &source, staging);
         ensure_npm_cache(paths)?;
         let mut npm_activity = NpmInstallActivity::new(version, &source.registry);
         let install_result = run_logged(
             &mut command,
             &paths.install_log,
-            ProcessTimeouts {
-                total: NPM_PROCESS_TOTAL_TIMEOUT,
-            },
+            ProcessTimeouts { total: npm_total },
             controller,
             |output, idle| npm_activity.observe(output, idle, notify),
         );
@@ -872,16 +894,21 @@ fn install_harness_into(
                 ));
             }
             Err(error) if error.code == "deploymentCancelled" => return Err(error),
-            // Registry fallback helps transport failures, but it cannot make
-            // npm's local peer-dependency solver faster. Do not repeat a full
-            // 30-minute resolution timeout against an equivalent source.
+            // Registry fallback helps transport failures, but npm's local
+            // peer-dependency solver is registry-independent, so a timed-out
+            // source gets one reduced fallback attempt instead of another
+            // full-resolution wait against an equivalent source.
             Err(error) if error.code == "processTimeout" => {
                 failures.push(format!(
                     "{}: {}",
                     display_source(&source.registry),
                     error.code
                 ));
-                break;
+                if timed_out_once {
+                    break;
+                }
+                timed_out_once = true;
+                npm_total = NPM_FALLBACK_PROCESS_TOTAL_TIMEOUT;
             }
             Err(error) => failures.push(format!(
                 "{}: {}",
@@ -910,6 +937,46 @@ fn cleanup_failed_staging(staging: &Path, controller: &DeploymentController) -> 
     Ok(())
 }
 
+fn harness_npm_install_command(
+    paths: &ApplicationPaths,
+    archive: &Path,
+    source: &HarnessInstallSource,
+    staging: &Path,
+) -> Command {
+    let npm = npm_cli(&paths.node_dir);
+    let mut command = Command::new(&paths.node_bin);
+    command
+        .arg(npm)
+        .arg("install")
+        .arg(archive)
+        .args([
+            "--no-save",
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+            "--package-lock=false",
+            // Prefer-online keeps registry packuments fresh: the shared npm
+            // cache can hold a packument fetched before a new release was
+            // published, and npm's offline mode would keep resolving that
+            // stale index and fail with ETARGET ("No matching version
+            // found") even though the version exists on the registry.
+            // Tarballs are still cached (they carry long max-age values).
+            "--prefer-online",
+            "--fetch-retries=2",
+            "--fetch-retry-factor=2",
+            "--fetch-retry-mintimeout=1000",
+            "--fetch-retry-maxtimeout=10000",
+            "--fetch-timeout=60000",
+        ])
+        .arg(format!("--cache={}", paths.cache_dir.join("npm").display()))
+        .arg("--loglevel=silly");
+    isolated_command(&mut command, paths);
+    command
+        .env("NPM_CONFIG_REGISTRY", &source.registry)
+        .current_dir(staging);
+    command
+}
+
 fn runtime_seed_has_space(paths: &ApplicationPaths) -> bool {
     let source_size = match owned_tree_size(&paths.dsh_dir) {
         Ok(size) => size,
@@ -927,8 +994,8 @@ fn runtime_seed_has_space(paths: &ApplicationPaths) -> bool {
             return false;
         }
     };
-    let required = source_size.saturating_add(RUNTIME_COPY_RESERVE_BYTES);
-    if !has_runtime_seed_capacity(source_size, available) {
+    let required = runtime_seed_required(source_size);
+    if available < required {
         log::warn!(
             "skipping Harness runtime reuse: {available} bytes available, {required} bytes required"
         );
@@ -937,8 +1004,13 @@ fn runtime_seed_has_space(paths: &ApplicationPaths) -> bool {
     true
 }
 
+fn runtime_seed_required(source_size: u64) -> u64 {
+    source_size.saturating_add(RUNTIME_COPY_RESERVE_BYTES)
+}
+
+#[cfg(test)]
 fn has_runtime_seed_capacity(source_size: u64, available: u64) -> bool {
-    available >= source_size.saturating_add(RUNTIME_COPY_RESERVE_BYTES)
+    available >= runtime_seed_required(source_size)
 }
 
 fn prepare_harness_staging(
@@ -1511,7 +1583,12 @@ fn prune_npm_cache_at(cache_dir: &Path, threshold: u64) -> AppResult<bool> {
 
     let expired = cache_dir.join(format!("npm.expired-{}", Uuid::new_v4()));
     fs::rename(&npm_cache, &expired)?;
-    remove_owned(&expired)?;
+    // Deleting a large cache can fail transiently (locked files, scanners);
+    // retry the removal on the next pruning pass instead of failing the
+    // installation that triggered the prune.
+    if let Err(error) = remove_owned(&expired) {
+        log::warn!("expired npm cache will be retried later: {error}");
+    }
     Ok(true)
 }
 
@@ -1530,7 +1607,11 @@ fn cleanup_expired_npm_caches(cache_dir: &Path) -> AppResult<()> {
 }
 
 fn ensure_npm_cache(paths: &ApplicationPaths) -> AppResult<()> {
-    prune_npm_cache_at(&paths.cache_dir, NPM_CACHE_PRUNE_THRESHOLD_BYTES)?;
+    // Cache pruning is best-effort: an oversized cache is a health issue,
+    // not a reason to fail the installation that is about to use it.
+    if let Err(error) = prune_npm_cache_at(&paths.cache_dir, NPM_CACHE_PRUNE_THRESHOLD_BYTES) {
+        log::warn!("npm cache pruning was skipped: {error}");
+    }
     let npm_cache = paths.cache_dir.join("npm");
     if npm_cache.exists() || npm_cache.is_symlink() {
         let metadata = fs::symlink_metadata(&npm_cache)?;
@@ -2603,6 +2684,7 @@ mod tests {
             temp.path(),
             Instant::now() + Duration::from_secs(2),
             &DeploymentController::default(),
+            &|_| {},
         )
         .unwrap();
         server.join().unwrap();
@@ -2631,6 +2713,7 @@ mod tests {
             temp.path(),
             Instant::now() + Duration::from_secs(2),
             &DeploymentController::default(),
+            &|_| {},
         )
         .unwrap_err();
         server.join().unwrap();
@@ -2666,6 +2749,7 @@ mod tests {
             temp.path(),
             Instant::now() + Duration::from_secs(2),
             &DeploymentController::default(),
+            &|_| {},
         )
         .unwrap();
         server.join().unwrap();
@@ -2696,6 +2780,7 @@ mod tests {
             temp.path(),
             Instant::now() + Duration::from_millis(20),
             &DeploymentController::default(),
+            &|_| {},
         )
         .unwrap_err();
         server.join().unwrap();
@@ -2772,6 +2857,60 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![slow, fast]
         );
+    }
+
+    #[test]
+    fn invalid_install_source_is_skipped_without_aborting_the_ranking() {
+        let metadata = harness_packument("0.1.0-rc.7");
+        let (valid, server) = serve_responses(vec![metadata]);
+
+        let ranked = ranked_install_registries(
+            &http_client().unwrap(),
+            vec!["ftp://unreachable.invalid".to_owned(), valid.clone()],
+            &Version::parse("0.1.0-rc.7").unwrap(),
+            None,
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(
+            ranked
+                .into_iter()
+                .map(|source| source.registry)
+                .collect::<Vec<_>>(),
+            vec![valid]
+        );
+    }
+
+    #[test]
+    fn harness_npm_install_revalidates_registry_packuments() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        let source = HarnessInstallSource {
+            registry: "https://registry.npmjs.org".to_owned(),
+            tarball: "https://registry.npmjs.org/archive.tgz".to_owned(),
+            integrity: String::new(),
+        };
+        let staging = paths.runtime_dir.join("dsh.staging-test");
+        fs::create_dir(&staging).unwrap();
+
+        let command =
+            harness_npm_install_command(&paths, Path::new("harness.tgz"), &source, &staging);
+        let args = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(args.iter().any(|argument| argument == "--prefer-online"));
+        assert!(
+            !args
+                .iter()
+                .any(|argument| argument.contains("prefer-offline"))
+        );
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "NPM_CONFIG_REGISTRY" && value == Some(std::ffi::OsStr::new(&source.registry))
+        }));
     }
 
     #[test]
