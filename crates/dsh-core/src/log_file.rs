@@ -39,7 +39,13 @@ impl BoundedLog {
             .map_err(|_| AppError::new("logLimitInvalid"))?;
         let bytes = line.as_bytes();
         let bytes = if bytes.len() > maximum_payload {
-            &bytes[bytes.len() - maximum_payload..]
+            // Keep the bounded tail aligned to a UTF-8 character boundary so
+            // the log file never contains truncated multi-byte sequences.
+            let mut start = bytes.len() - maximum_payload;
+            while start < bytes.len() && !line.is_char_boundary(start) {
+                start += 1;
+            }
+            &bytes[start..]
         } else {
             bytes
         };
@@ -92,6 +98,21 @@ mod tests {
 
         assert!(fs::metadata(&path).unwrap().len() <= 16);
         assert_eq!(fs::read_to_string(path).unwrap(), "abcdefghij\n");
+    }
+
+    #[test]
+    fn bounded_log_truncation_keeps_valid_utf8() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("service.log");
+        let mut log = BoundedLog::open(&path, 16).unwrap();
+
+        // Long multi-byte line: the bounded tail must stay valid UTF-8 even
+        // when the byte cut would land inside a character.
+        log.write_line(&"日志行".repeat(16)).unwrap();
+
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.len() <= 16);
+        assert!(content.ends_with('\n'));
     }
 
     #[test]
