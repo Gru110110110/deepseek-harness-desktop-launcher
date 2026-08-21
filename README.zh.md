@@ -11,8 +11,9 @@ DSH Launcher 是已发布 `@deepseek-ai/dsh` 包的非官方桌面启动器。�
 - macOS arm64 与 x64 DMG 安装包
 - Windows x64 按用户安装的 NSIS 安装包；不再发布便携 ZIP
 - 固定 Node.js 24.19.0，只有平台专属 SHA-256 匹配的归档才能进入运行环境
-- 精确安装 `@deepseek-ai/dsh`，支持 npm registry 回退
+- 精确安装 `@deepseek-ai/dsh`；由第一个 npm registry 确定版本，首次安装优先选择已确认存在该精确版本且响应最快的来源，后续保持成功来源以复用缓存
 - staging、可执行 smoke 校验、原子发布、启动恢复与失败回滚
+- Harness 安装实时展示依赖解析、依赖包获取、运行环境写入、验证与启用阶段；npm 长时间无输出时明确显示等待状态，并以空闲超时区分缓慢安装与真正停滞
 - 浏览器选择、系统托盘生命周期、中英双语、浅色/深色/跟随系统主题
 - Harness 更新与带密码学签名的桌面应用更新相互独立；两者都会自动检查，也可点击侧栏版本号手动检查，同时有新版时分别显示并由用户选择更新顺序
 
@@ -60,6 +61,8 @@ Rust 应用保持原有磁盘协议：
 CC Switch 只是可选的只读来源。导入器以只读方式打开 `cc-switch.db`，只接受具有字面凭据、非回环 HTTP(S) 地址、受支持协议且至少包含一个模型的独立 Claude provider；OAuth、托管账号、依赖代理和含义不明确的记录全部跳过。只有在能可靠理解既有文档结构时才补充缺失值。凭据只进入 `.credentials.yaml`，永不进入 settings 或日志。双文件发布失败时会恢复为完全一致的原始字节。如果 Windows 权限或其他本地 I/O 问题导致这项可选导入失败，启动器会提示已跳过，并继续安装和启动 Harness。
 
 测试、检查、构建和打包必须设置临时的 `DSH_DESKTOP_HOME`、`DSH_HOME`、`DSH_DESKTOP_SOURCE_HOME` 与 `DSH_DESKTOP_CC_SWITCH_HOME`。不得接触真实用户目录、Keychain、凭据存储或生产数据。
+
+Harness 更新继续复用私有 npm 下载缓存。缓存整体连续 30 天未被安装流程使用且达到 1 GiB 时，启动器会主动清理；该策略只处理 `cache/npm`，不会触碰 `dsh-home`、配置、会话、凭据或当前及上一套可回滚运行环境。
 
 ## 开发
 
@@ -120,7 +123,7 @@ pnpm tauri dev
 | `DSH_DESKTOP_NODE_VERSION`   | 精确 Node 覆盖值；必须同时设置 `DSH_DESKTOP_NODE_SHA256`                                                                           |
 | `DSH_DESKTOP_NODE_SHA256`    | 自定义 Node 归档的 SHA-256 信任根                                                                                                  |
 | `DSH_DESKTOP_NODE_BASES`     | 逗号分隔的 Node 镜像；显式配置会关闭默认回退                                                                                       |
-| `DSH_DESKTOP_NPM_REGISTRIES` | 逗号分隔的 npm registry；第一个是版本权威源，后续源只作为同一精确版本的安装镜像；显式配置会关闭默认回退                              |
+| `DSH_DESKTOP_NPM_REGISTRIES` | 逗号分隔的 npm registry；第一个是版本权威源，后续源只作为同一精确版本的安装镜像；显式配置会关闭默认回退                            |
 
 ## 许可
 

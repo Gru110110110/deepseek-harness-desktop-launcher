@@ -11,8 +11,9 @@ The application uses React for presentation, a narrow Tauri command/event adapte
 - macOS arm64 and x64 DMG installers
 - Windows x64 per-user NSIS installer; no portable ZIP distribution
 - Pinned Node.js 24.19.0 archives admitted only by platform-specific SHA-256
-- Exact `@deepseek-ai/dsh` installation with npm registry fallback
+- Exact `@deepseek-ai/dsh` installation; the first npm registry remains the version authority, the first install prefers the fastest source confirmed to carry that version, and later installs keep the successful source for cache reuse
 - Transactional staging, executable smoke checks, atomic publication, startup recovery, and rollback
+- Live Harness installation phases for dependency resolution, package fetching, runtime writes, validation, and activation; prolonged npm silence is shown as a waiting state, and an idle timeout distinguishes slow work from a real stall
 - Browser selection, system tray lifecycle, English/Simplified Chinese, and light/dark/system themes
 - Separate Harness updates and cryptographically signed desktop updates; both check automatically, can be checked from their sidebar version rows, and remain independently actionable when both have releases available
 
@@ -60,6 +61,8 @@ An explicit `DSH_HOME` disables all imports. Otherwise, the launcher only discov
 CC Switch remains an optional read-only source. The importer opens `cc-switch.db` read-only, accepts only standalone Claude providers with a literal credential, non-loopback HTTP(S) endpoint, supported protocol, and at least one model, and skips OAuth, managed, proxy-dependent, and ambiguous rows. Existing documents are conservatively extended only when their structure is understood. Credentials go only to `.credentials.yaml`, never settings or logs. Two-file publication is rolled back to the exact original bytes on failure. If Windows permissions or another local I/O problem prevents this optional import, the launcher reports that it was skipped and continues installing and starting Harness.
 
 Tests, checks, builds, and packaging must set temporary `DSH_DESKTOP_HOME`, `DSH_HOME`, `DSH_DESKTOP_SOURCE_HOME`, and `DSH_DESKTOP_CC_SWITCH_HOME`. They must never touch real user homes, Keychain, credential stores, or production data.
+
+Harness updates continue to reuse the private npm download cache. When the cache as a whole has not been used by an installation for 30 consecutive days and has reached 1 GiB, the launcher prunes it automatically. This policy only touches `cache/npm`; it never touches `dsh-home`, settings, sessions, credentials, or the active and previous rollback runtimes.
 
 ## Development
 
@@ -120,7 +123,7 @@ The checked-in updater public key is intentionally empty: local source builds do
 | `DSH_DESKTOP_NODE_VERSION`   | Exact Node override; requires `DSH_DESKTOP_NODE_SHA256`                                                                                                                                   |
 | `DSH_DESKTOP_NODE_SHA256`    | SHA-256 trust root for an overridden Node archive                                                                                                                                         |
 | `DSH_DESKTOP_NODE_BASES`     | Comma-separated Node mirrors; explicit values suppress defaults                                                                                                                           |
-| `DSH_DESKTOP_NPM_REGISTRIES` | Comma-separated npm registries; the first is the version authority and later entries are exact-version install mirrors; explicit values suppress defaults                                  |
+| `DSH_DESKTOP_NPM_REGISTRIES` | Comma-separated npm registries; the first is the version authority and later entries are exact-version install mirrors; explicit values suppress defaults                                 |
 
 ## License
 

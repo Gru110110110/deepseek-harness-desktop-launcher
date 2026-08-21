@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use fs2::{FileExt, lock_contended_error};
@@ -32,6 +32,12 @@ const NPM_REGISTRIES: [&str; 2] = [
 ];
 const MAX_NODE_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_NODE_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
+const NPM_CACHE_PRUNE_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
+const NPM_CACHE_STALE_AFTER: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const NPM_CACHE_CHECK_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const NPM_PROCESS_IDLE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+const NPM_PROCESS_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const NPM_WAITING_AFTER: Duration = Duration::from_secs(30);
 const RELEASE_SOURCE_ATTEMPTS: usize = 3;
 const RELEASE_NODE_ASSETS: [(&str, &str); 3] = [
     (
@@ -57,6 +63,9 @@ pub enum DeploymentEvent {
     Progress {
         done: u64,
         total: Option<u64>,
+    },
+    ActivityUpdate {
+        values: BTreeMap<String, String>,
     },
 }
 
@@ -255,6 +264,128 @@ fn query_registry_exact_version(
     Ok(())
 }
 
+fn ranked_install_registries(
+    client: &Client,
+    registries: Vec<String>,
+    expected: &Version,
+    preferred: Option<&str>,
+) -> AppResult<Vec<String>> {
+    let mut available = Vec::new();
+    for (index, registry) in registries.into_iter().enumerate() {
+        validate_network_source(&registry)?;
+        let started = Instant::now();
+        match query_registry_exact_version(client, &registry, expected) {
+            Ok(()) => available.push((started.elapsed(), index, registry)),
+            Err(error) => log::warn!(
+                "skipping Harness {expected} source {}: {error}",
+                display_source(&registry)
+            ),
+        }
+    }
+    available.sort_by_key(|(latency, index, registry)| {
+        (preferred != Some(registry.as_str()), *latency, *index)
+    });
+    Ok(available
+        .into_iter()
+        .map(|(_, _, registry)| registry)
+        .collect())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NpmInstallPhase {
+    Preparing,
+    Resolving,
+    Downloading,
+    Writing,
+}
+
+struct NpmInstallActivity {
+    version: String,
+    source: String,
+    pending: String,
+    phase: NpmInstallPhase,
+    resolved: u64,
+    packages: u64,
+    written: u64,
+    last_emitted: Option<(NpmInstallPhase, u64, bool)>,
+}
+
+impl NpmInstallActivity {
+    fn new(version: &str, registry: &str) -> Self {
+        Self {
+            version: version.to_owned(),
+            source: display_source(registry),
+            pending: String::new(),
+            phase: NpmInstallPhase::Preparing,
+            resolved: 0,
+            packages: 0,
+            written: 0,
+            last_emitted: None,
+        }
+    }
+
+    fn observe(&mut self, output: &str, idle: Duration, notify: &impl Fn(DeploymentEvent)) {
+        self.pending.push_str(output);
+        if let Some(end) = self.pending.rfind('\n') {
+            let tail = self.pending.split_off(end + 1);
+            let complete = std::mem::replace(&mut self.pending, tail);
+            for line in complete.lines() {
+                if line.contains("silly fetch manifest ") {
+                    self.resolved = self.resolved.saturating_add(1);
+                    self.phase = self.phase.max(NpmInstallPhase::Resolving);
+                }
+                if (line.contains("http fetch ") || line.contains("http cache "))
+                    && line.contains(".tgz")
+                {
+                    self.packages = self.packages.saturating_add(1);
+                    self.phase = self.phase.max(NpmInstallPhase::Downloading);
+                }
+                if line.contains("silly ADD ") {
+                    self.written = self.written.saturating_add(1);
+                    self.phase = NpmInstallPhase::Writing;
+                }
+            }
+        }
+
+        let waiting = idle >= NPM_WAITING_AFTER;
+        let processed = match self.phase {
+            NpmInstallPhase::Preparing => 0,
+            NpmInstallPhase::Resolving => self.resolved,
+            NpmInstallPhase::Downloading => self.packages,
+            NpmInstallPhase::Writing => self.written,
+        };
+        let current = (self.phase, processed, waiting);
+        if self.last_emitted == Some(current) {
+            return;
+        }
+
+        let code = match self.phase {
+            NpmInstallPhase::Preparing => ActivityCode::InstallingHarness,
+            NpmInstallPhase::Resolving => ActivityCode::ResolvingHarnessDependencies,
+            NpmInstallPhase::Downloading => ActivityCode::DownloadingHarnessPackages,
+            NpmInstallPhase::Writing => ActivityCode::WritingHarnessRuntime,
+        };
+        let values = BTreeMap::from([
+            ("version".to_owned(), self.version.clone()),
+            ("source".to_owned(), self.source.clone()),
+            ("processed".to_owned(), processed.to_string()),
+            (
+                "status".to_owned(),
+                if waiting { "waiting" } else { "active" }.to_owned(),
+            ),
+        ]);
+        if self
+            .last_emitted
+            .is_none_or(|(previous, _, _)| previous != self.phase)
+        {
+            notify(DeploymentEvent::Activity { code, values });
+        } else {
+            notify(DeploymentEvent::ActivityUpdate { values });
+        }
+        self.last_emitted = Some(current);
+    }
+}
+
 pub fn deploy_runtime(
     paths: &ApplicationPaths,
     force: bool,
@@ -274,6 +405,7 @@ pub fn deploy_runtime(
     let result = (|| {
         recover_interrupted(paths)?;
         recover_valid_previous(paths)?;
+        prune_stale_npm_cache(paths);
         activity(&notify, ActivityCode::CheckingRuntime, []);
         if !force && is_runtime_ready(paths) {
             return installed_version(paths)
@@ -410,21 +542,15 @@ fn install_harness(
     let client = http_client()?;
     let expected = Version::parse(version)
         .map_err(|_| AppError::new("runtimeVersionInvalid").value("version", version))?;
-    let registries = npm_registries();
+    let preferred_registry = fs::read_to_string(paths.cache_dir.join("npm.registry")).ok();
+    let registries = ranked_install_registries(
+        &client,
+        npm_registries(),
+        &expected,
+        preferred_registry.as_deref().map(str::trim),
+    )?;
     for registry in registries {
         controller.check()?;
-        validate_network_source(&registry)?;
-        // A mirror may advertise a dist-tag before it has synchronized the
-        // corresponding package. Only invoke npm after this exact version is
-        // available from the source; otherwise fail over without a long npm
-        // retry cycle.
-        if let Err(error) = query_registry_exact_version(&client, &registry, &expected) {
-            log::warn!(
-                "skipping Harness {version} source {}: {error}",
-                display_source(&registry)
-            );
-            continue;
-        }
         let _ = remove_owned(&staging);
         fs::create_dir(&staging)?;
         atomic_write(
@@ -458,15 +584,22 @@ fn install_harness(
                 "--fetch-timeout=60000",
             ])
             .arg(format!("--cache={}", paths.cache_dir.join("npm").display()));
+        command.arg("--loglevel=silly");
         isolated_command(&mut command, paths);
         command
             .env("NPM_CONFIG_REGISTRY", &registry)
             .current_dir(&staging);
+        mark_npm_cache_used(paths);
+        let mut npm_activity = NpmInstallActivity::new(version, &registry);
         if run_logged(
             &mut command,
             &paths.install_log,
-            Duration::from_secs(15 * 60),
+            ProcessTimeouts {
+                idle: NPM_PROCESS_IDLE_TIMEOUT,
+                total: NPM_PROCESS_TOTAL_TIMEOUT,
+            },
             controller,
+            |output, idle| npm_activity.observe(output, idle, notify),
         )
         .is_ok()
         {
@@ -477,6 +610,12 @@ fn install_harness(
             );
             fix_spawn_helper(&staging);
             if dsh_valid(paths, &paths.node_dir, &staging, version) {
+                if let Err(error) = atomic_write(
+                    &paths.cache_dir.join("npm.registry"),
+                    format!("{registry}\n").as_bytes(),
+                ) {
+                    log::warn!("preferred npm registry could not be saved: {error}");
+                }
                 return Ok(staging);
             }
         }
@@ -816,6 +955,109 @@ fn recover_interrupted(paths: &ApplicationPaths) -> AppResult<()> {
     Ok(())
 }
 
+fn prune_stale_npm_cache(paths: &ApplicationPaths) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Err(error) = prune_npm_cache_at(
+        &paths.cache_dir,
+        now,
+        NPM_CACHE_PRUNE_THRESHOLD_BYTES,
+        NPM_CACHE_STALE_AFTER,
+    ) {
+        log::warn!("stale npm cache cleanup was skipped: {error}");
+    }
+}
+
+fn prune_npm_cache_at(
+    cache_dir: &Path,
+    now: u64,
+    threshold: u64,
+    stale_after: Duration,
+) -> AppResult<bool> {
+    for entry in fs::read_dir(cache_dir)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("npm.expired-")
+        {
+            remove_owned(&entry.path())?;
+        }
+    }
+
+    let npm_cache = cache_dir.join("npm");
+    if !npm_cache.exists() && !npm_cache.is_symlink() {
+        return Ok(false);
+    }
+    let usage_marker = cache_dir.join("npm.last-used");
+    let check_marker = cache_dir.join("npm.last-prune-check");
+    let last_used = fs::read_to_string(&usage_marker)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let Some(last_used) = last_used else {
+        atomic_write(&usage_marker, format!("{now}\n").as_bytes())?;
+        atomic_write(&check_marker, format!("{now}\n").as_bytes())?;
+        return Ok(false);
+    };
+    if now.saturating_sub(last_used) < stale_after.as_secs() {
+        return Ok(false);
+    }
+    let checked_recently = fs::read_to_string(&check_marker)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .is_some_and(|checked| now.saturating_sub(checked) < NPM_CACHE_CHECK_INTERVAL.as_secs());
+    if checked_recently {
+        return Ok(false);
+    }
+    atomic_write(&check_marker, format!("{now}\n").as_bytes())?;
+    if owned_tree_size(&npm_cache)? < threshold {
+        return Ok(false);
+    }
+
+    let expired = cache_dir.join(format!("npm.expired-{}", Uuid::new_v4()));
+    fs::rename(&npm_cache, &expired)?;
+    if let Err(error) = remove_owned(&expired) {
+        log::warn!("expired npm cache will be retried later: {error}");
+    }
+    atomic_write(&usage_marker, format!("{now}\n").as_bytes())?;
+    Ok(true)
+}
+
+fn owned_tree_size(path: &Path) -> AppResult<u64> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Ok(metadata.len());
+    }
+    let mut total = 0_u64;
+    for entry in walkdir::WalkDir::new(path).follow_links(false) {
+        let entry = entry.map_err(|error| {
+            AppError::new("readDirectoryFailed")
+                .detail(error.to_string())
+                .value("path", path.display())
+        })?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_file() || metadata.file_type().is_symlink() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
+}
+
+fn mark_npm_cache_used(paths: &ApplicationPaths) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Err(error) = atomic_write(
+        &paths.cache_dir.join("npm.last-used"),
+        format!("{now}\n").as_bytes(),
+    ) {
+        log::warn!("npm cache usage marker could not be updated: {error}");
+    }
+}
+
 fn recover_valid_previous(paths: &ApplicationPaths) -> AppResult<()> {
     let node_previous = paths.runtime_dir.join("node.previous");
     let dsh_previous = paths.runtime_dir.join("dsh.previous");
@@ -976,16 +1218,26 @@ fn dsh_manifest_version(dir: &Path) -> Option<String> {
     Version::parse(version).ok().map(|_| version.to_owned())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ProcessTimeouts {
+    idle: Duration,
+    total: Duration,
+}
+
 fn run_logged(
     command: &mut Command,
     log_path: &Path,
-    timeout: Duration,
+    timeouts: ProcessTimeouts,
     controller: &DeploymentController,
+    mut observe: impl FnMut(&str, Duration),
 ) -> AppResult<()> {
     let log = OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)?;
+    let output_start = log.metadata()?.len();
+    let mut log_reader = File::open(log_path)?;
+    log_reader.seek(SeekFrom::Start(output_start))?;
     command
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
@@ -994,9 +1246,23 @@ fn run_logged(
     let mut child = command.spawn()?;
     #[cfg(windows)]
     let job = WindowsProcessGuard::attach(&child)?;
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let mut last_output = started;
+    let mut last_observation = started;
     loop {
-        if controller.check().is_err() || Instant::now() >= deadline {
+        let output = read_appended_log(&mut log_reader)?;
+        if !output.is_empty() {
+            last_output = Instant::now();
+        }
+        let now = Instant::now();
+        if !output.is_empty() || now.duration_since(last_observation) >= Duration::from_secs(1) {
+            observe(&output, now.duration_since(last_output));
+            last_observation = now;
+        }
+        if controller.check().is_err()
+            || now.duration_since(started) >= timeouts.total
+            || now.duration_since(last_output) >= timeouts.idle
+        {
             #[cfg(unix)]
             stop_unix_command_tree(&mut child, controller)?;
             #[cfg(windows)]
@@ -1012,6 +1278,10 @@ fn run_logged(
         #[cfg(windows)]
         job.observe()?;
         if let Some(status) = child.try_wait()? {
+            let output = read_appended_log(&mut log_reader)?;
+            if !output.is_empty() {
+                observe(&output, Duration::ZERO);
+            }
             #[cfg(unix)]
             stop_unix_command_tree(&mut child, controller)?;
             #[cfg(windows)]
@@ -1024,6 +1294,12 @@ fn run_logged(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn read_appended_log(log: &mut File) -> AppResult<String> {
+    let mut output = Vec::new();
+    log.read_to_end(&mut output)?;
+    Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
 #[cfg(unix)]
@@ -1702,7 +1978,7 @@ fn fix_spawn_helper(_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{net::TcpListener, thread};
+    use std::{cell::RefCell, net::TcpListener, thread};
 
     #[test]
     fn node_assets_are_pinned_for_release_targets() {
@@ -1762,6 +2038,213 @@ mod tests {
         server.join().unwrap();
 
         assert_eq!(version, Version::parse("0.1.0-rc.7").unwrap());
+    }
+
+    #[test]
+    fn exact_install_sources_are_ranked_by_observed_latency() {
+        let metadata = json_response(r#"{"version":"0.1.0-rc.7"}"#);
+        let slow_response = metadata.clone();
+        let (slow, slow_server) = serve_once(move |mut stream| {
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            thread::sleep(Duration::from_millis(40));
+            stream.write_all(slow_response.as_bytes()).unwrap();
+        });
+        let (fast, fast_server) = serve_once(move |mut stream| {
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            stream.write_all(metadata.as_bytes()).unwrap();
+        });
+
+        let ranked = ranked_install_registries(
+            &http_client().unwrap(),
+            vec![slow.clone(), fast.clone()],
+            &Version::parse("0.1.0-rc.7").unwrap(),
+            None,
+        )
+        .unwrap();
+        slow_server.join().unwrap();
+        fast_server.join().unwrap();
+
+        assert_eq!(ranked, vec![fast, slow]);
+    }
+
+    #[test]
+    fn last_successful_install_source_is_kept_for_cache_reuse() {
+        let metadata = json_response(r#"{"version":"0.1.0-rc.7"}"#);
+        let slow_response = metadata.clone();
+        let (slow, slow_server) = serve_once(move |mut stream| {
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            thread::sleep(Duration::from_millis(40));
+            stream.write_all(slow_response.as_bytes()).unwrap();
+        });
+        let (fast, fast_server) = serve_once(move |mut stream| {
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            stream.write_all(metadata.as_bytes()).unwrap();
+        });
+
+        let ranked = ranked_install_registries(
+            &http_client().unwrap(),
+            vec![slow.clone(), fast.clone()],
+            &Version::parse("0.1.0-rc.7").unwrap(),
+            Some(&slow),
+        )
+        .unwrap();
+        slow_server.join().unwrap();
+        fast_server.join().unwrap();
+
+        assert_eq!(ranked, vec![slow, fast]);
+    }
+
+    #[test]
+    fn npm_output_reports_real_install_phases_and_waiting() {
+        let events = RefCell::new(Vec::new());
+        let notify = |event| events.borrow_mut().push(event);
+        let mut activity = NpmInstallActivity::new("0.1.0-rc.7", "https://registry.npmjs.org");
+
+        activity.observe(
+            "14 silly fetch manifest @deepseek-ai/dsh@0.1.0-rc.7\n",
+            Duration::ZERO,
+            &notify,
+        );
+        activity.observe(
+            "20 http fetch GET 200 https://registry.npmjs.org/a/-/a-1.0.0.tgz\n",
+            Duration::ZERO,
+            &notify,
+        );
+        activity.observe("21 silly ADD node_modules/a\n", Duration::ZERO, &notify);
+        activity.observe("", NPM_WAITING_AFTER, &notify);
+
+        let events = events.into_inner();
+        assert!(matches!(
+            events.first(),
+            Some(DeploymentEvent::Activity {
+                code: ActivityCode::ResolvingHarnessDependencies,
+                ..
+            })
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DeploymentEvent::Activity {
+                code: ActivityCode::DownloadingHarnessPackages,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DeploymentEvent::Activity {
+                code: ActivityCode::WritingHarnessRuntime,
+                ..
+            }
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(DeploymentEvent::ActivityUpdate { values })
+                if values.get("status").map(String::as_str) == Some("waiting")
+        ));
+    }
+
+    #[test]
+    fn run_logged_streams_appended_output_to_the_observer() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "runtime::tests::run_logged_output_helper",
+                "--nocapture",
+            ])
+            .env("DSH_RUN_LOGGED_OUTPUT_HELPER", "1");
+        let observed = RefCell::new(Vec::new());
+
+        run_logged(
+            &mut command,
+            &temp.path().join("install.log"),
+            ProcessTimeouts {
+                idle: Duration::from_secs(5),
+                total: Duration::from_secs(10),
+            },
+            &DeploymentController::default(),
+            |output, _| {
+                if !output.is_empty() {
+                    observed.borrow_mut().push(output.to_owned());
+                }
+            },
+        )
+        .unwrap();
+
+        let observed = observed.into_inner();
+        assert!(observed.iter().any(|chunk| chunk.contains("first-output")));
+        assert!(observed.iter().any(|chunk| chunk.contains("second-output")));
+    }
+
+    #[test]
+    fn run_logged_output_helper() {
+        if std::env::var_os("DSH_RUN_LOGGED_OUTPUT_HELPER").is_none() {
+            return;
+        }
+        println!("first-output");
+        std::io::stdout().flush().unwrap();
+        thread::sleep(Duration::from_millis(250));
+        println!("second-output");
+        std::io::stdout().flush().unwrap();
+    }
+
+    #[test]
+    fn stale_npm_cache_is_pruned_only_after_reaching_the_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let npm = cache.join("npm");
+        fs::create_dir_all(&npm).unwrap();
+        fs::write(npm.join("cached-package"), [0_u8; 8]).unwrap();
+        fs::write(cache.join("npm.last-used"), "100\n").unwrap();
+
+        assert!(!prune_npm_cache_at(&cache, 200, 9, Duration::from_secs(10)).unwrap());
+        assert!(npm.exists());
+        assert!(
+            prune_npm_cache_at(
+                &cache,
+                200 + NPM_CACHE_CHECK_INTERVAL.as_secs(),
+                8,
+                Duration::from_secs(10),
+            )
+            .unwrap()
+        );
+        assert!(!npm.exists());
+    }
+
+    #[test]
+    fn recently_used_npm_cache_is_preserved_even_at_the_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let npm = cache.join("npm");
+        fs::create_dir_all(&npm).unwrap();
+        fs::write(npm.join("cached-package"), [0_u8; 8]).unwrap();
+        fs::write(cache.join("npm.last-used"), "195\n").unwrap();
+
+        assert!(!prune_npm_cache_at(&cache, 200, 8, Duration::from_secs(10)).unwrap());
+        assert!(npm.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_cache_pruning_never_follows_links_outside_the_cache() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let npm = cache.join("npm");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&npm).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"user-data").unwrap();
+        symlink(&outside, npm.join("external-link")).unwrap();
+        fs::write(cache.join("npm.last-used"), "100\n").unwrap();
+
+        assert!(prune_npm_cache_at(&cache, 200, 1, Duration::from_secs(10)).unwrap());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"user-data");
     }
 
     #[test]

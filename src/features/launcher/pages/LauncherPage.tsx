@@ -52,10 +52,15 @@ export function LauncherPage() {
     ? formatDuration(now - snapshot.activity.startedAtMs)
     : null;
   const activityText = snapshot.activity
-    ? t(`activity.${snapshot.activity.code}`, {
-        ...snapshot.activity.values,
-        elapsed: activityElapsed,
-      })
+    ? t(
+        snapshot.activity.values.status === "waiting"
+          ? "activity.installingHarnessWaiting"
+          : `activity.${snapshot.activity.code}`,
+        {
+          ...snapshot.activity.values,
+          elapsed: activityElapsed,
+        },
+      )
     : null;
   const progressPercent =
     snapshot.progress.kind === "determinate" && snapshot.progress.total > 0

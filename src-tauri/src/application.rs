@@ -345,6 +345,11 @@ impl AppState {
                                 ProgressState::Determinate { done, total }
                             })
                     }),
+                    DeploymentEvent::ActivityUpdate { values } => state.mutate(|snapshot| {
+                        if let Some(activity) = snapshot.activity.as_mut() {
+                            activity.values = values;
+                        }
+                    }),
                 }
             },
         );
