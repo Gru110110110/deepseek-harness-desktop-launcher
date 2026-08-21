@@ -91,6 +91,7 @@ pub enum ActivityCode {
     DownloadingNode,
     VerifyingNode,
     CheckingSources,
+    CopyingHarnessRuntime,
     InstallingHarness,
     ResolvingHarnessDependencies,
     DownloadingHarnessPackages,

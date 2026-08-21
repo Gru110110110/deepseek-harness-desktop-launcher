@@ -12,7 +12,7 @@ The application uses React for presentation, a narrow Tauri command/event adapte
 - Windows x64 per-user NSIS installer; no portable ZIP distribution
 - Pinned Node.js 24.19.0 archives admitted only by platform-specific SHA-256
 - Exact `@deepseek-ai/dsh` installation; the first npm registry remains the version authority, the first install prefers the fastest source confirmed to carry that version, and later installs keep the successful source for cache reuse
-- Transactional staging, executable smoke checks, atomic publication, startup recovery, and rollback
+- Transactional staging seeded from a valid installed Harness runtime when available and sufficient free space remains, executable smoke checks, atomic publication, startup recovery, and rollback; seed-copy failures fall back to a clean candidate without changing the active runtime
 - Live Harness installation phases for dependency resolution, package fetching, runtime writes, validation, and activation; prolonged npm silence explains that dependency calculation may still be active instead of treating missing log output as proof of a stall
 - Browser selection, system tray lifecycle, English/Simplified Chinese, and light/dark/system themes
 - Separate Harness updates and cryptographically signed desktop updates; both check automatically, can be checked from their sidebar version rows, and remain independently actionable when both have releases available
@@ -62,7 +62,7 @@ CC Switch remains an optional read-only source. The importer opens `cc-switch.db
 
 Tests, checks, builds, and packaging must set temporary `DSH_DESKTOP_HOME`, `DSH_HOME`, `DSH_DESKTOP_SOURCE_HOME`, and `DSH_DESKTOP_CC_SWITCH_HOME`. They must never touch real user homes, Keychain, credential stores, or production data.
 
-Harness updates continue to reuse the private npm download cache. When the cache as a whole has not been used by an installation for 30 consecutive days and has reached 1 GiB, the launcher prunes it automatically. This policy only touches `cache/npm`; it never touches `dsh-home`, settings, sessions, credentials, or the active and previous rollback runtimes.
+Harness updates continue to reuse the private npm download cache, but `cache/npm` is checked before and after installations and removed as soon as it reaches 1 GiB. Old pinned Node archives and interrupted archive downloads are also pruned, while the current verified Node archive remains reusable. `install.log` and `server.log` are each bounded to 16 MiB. These policies never touch `dsh-home`, settings, sessions, credentials, or the active and single previous rollback runtime.
 
 ## Development
 

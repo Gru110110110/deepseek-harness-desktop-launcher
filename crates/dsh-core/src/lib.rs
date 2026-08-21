@@ -7,6 +7,7 @@
 pub mod browser;
 pub mod error;
 pub mod import;
+mod log_file;
 pub mod migration;
 pub mod model;
 pub mod paths;

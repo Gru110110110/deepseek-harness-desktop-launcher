@@ -1,10 +1,10 @@
 use std::{
-    fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    fs,
+    io::{BufRead, BufReader},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -12,10 +12,7 @@ use std::{
 use std::{io::Read, process::ChildStdin};
 
 #[cfg(windows)]
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::process_recovery::{
     SERVICE_GUARD_ARGUMENT, SERVICE_GUARD_FREE_PORT_ARGUMENT, SERVICE_GUARD_HOME_ARGUMENT,
@@ -26,6 +23,7 @@ use crate::runtime::WindowsProcessGuard;
 use crate::runtime::process_tree_alive;
 use crate::{
     AppError, AppResult, ApplicationPaths,
+    log_file::{BoundedLog, SERVER_LOG_MAX_BYTES},
     paths::atomic_write,
     process_recovery::recover_owned_services,
     runtime::{configure_process_group, terminate_tree},
@@ -101,10 +99,10 @@ impl ServerManager {
                 break;
             }
             let (sender, receiver) = mpsc::channel();
-            let log = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.paths.server_log)?;
+            let log = Arc::new(Mutex::new(BoundedLog::open(
+                &self.paths.server_log,
+                SERVER_LOG_MAX_BYTES,
+            )?));
             let mut command = {
                 let executable = std::env::current_exe()
                     .map_err(|error| AppError::io("serviceGuardFailed", &error))?;
@@ -162,14 +160,11 @@ impl ServerManager {
                 match thread::Builder::new()
                     .name("dsh-web-output".into())
                     .spawn(move || {
-                        let mut log_out = log;
-                        let stderr_log = log_out.try_clone().ok();
                         let sender_out = sender.clone();
+                        let stdout_log = Arc::clone(&log);
                         let stdout_thread =
-                            thread::spawn(move || capture(stdout, &mut log_out, &sender_out));
-                        if let Some(mut stderr_log) = stderr_log {
-                            capture(stderr, &mut stderr_log, &sender);
-                        }
+                            thread::spawn(move || capture(stdout, &stdout_log, &sender_out));
+                        capture(stderr, &log, &sender);
                         let _ = stdout_thread.join();
                     }) {
                     Ok(thread) => thread,
@@ -593,10 +588,15 @@ fn stop_child(child: &mut Child) {
     }
 }
 
-fn capture(stream: impl std::io::Read, log: &mut fs::File, sender: &mpsc::Sender<String>) {
+fn capture(
+    stream: impl std::io::Read,
+    log: &Arc<Mutex<BoundedLog>>,
+    sender: &mpsc::Sender<String>,
+) {
     for line in BufReader::new(stream).lines().map_while(Result::ok) {
-        let _ = writeln!(log, "{line}");
-        let _ = log.flush();
+        if let Ok(mut log) = log.lock() {
+            let _ = log.write_line(&line);
+        }
         let _ = sender.send(line);
     }
 }
@@ -691,6 +691,24 @@ mod tests {
         assert_eq!(parse_web_url("http://127.0.0.1:3000"), None);
         assert_eq!(parse_web_url("dsh web: file:///tmp/a"), None);
         assert_eq!(parse_web_url("dsh web: http://example.com:3000"), None);
+    }
+
+    #[test]
+    fn captured_service_output_stays_within_the_log_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.log");
+        let log = Arc::new(Mutex::new(BoundedLog::open(&path, 16).unwrap()));
+        let (sender, receiver) = mpsc::channel();
+
+        capture(
+            std::io::Cursor::new(b"first-line\nsecond-line\n"),
+            &log,
+            &sender,
+        );
+
+        drop(sender);
+        assert_eq!(receiver.into_iter().count(), 2);
+        assert!(fs::metadata(path).unwrap().len() <= 16);
     }
 
     #[cfg(any(unix, windows))]

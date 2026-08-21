@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use fs2::{FileExt, lock_contended_error};
@@ -19,7 +19,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{ActivityCode, AppError, AppResult, ApplicationPaths, paths::atomic_write};
+use crate::{
+    ActivityCode, AppError, AppResult, ApplicationPaths,
+    log_file::{INSTALL_LOG_MAX_BYTES, trim_log_tail},
+    paths::atomic_write,
+};
 
 pub const NODE_VERSION: &str = "24.19.0";
 const NODE_BASES: [&str; 2] = [
@@ -33,8 +37,7 @@ const NPM_REGISTRIES: [&str; 2] = [
 const MAX_NODE_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_NODE_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
 const NPM_CACHE_PRUNE_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
-const NPM_CACHE_STALE_AFTER: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-const NPM_CACHE_CHECK_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const RUNTIME_COPY_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 const NPM_PROCESS_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const NPM_WAITING_AFTER: Duration = Duration::from_secs(30);
 const RELEASE_SOURCE_ATTEMPTS: usize = 3;
@@ -408,7 +411,8 @@ pub fn deploy_runtime(
     let result = (|| {
         recover_interrupted(paths)?;
         recover_valid_previous(paths)?;
-        prune_stale_npm_cache(paths);
+        trim_log_tail(&paths.install_log, INSTALL_LOG_MAX_BYTES)?;
+        prune_oversized_npm_cache(paths);
         activity(&notify, ActivityCode::CheckingRuntime, []);
         if !force && is_runtime_ready(paths) {
             return installed_version(paths)
@@ -486,10 +490,13 @@ fn ensure_node(
     notify: &impl Fn(DeploymentEvent),
 ) -> AppResult<Option<PathBuf>> {
     let version = resolve_node_version()?;
+    let filename = node_filename(&version)?;
+    if let Err(error) = prune_old_node_archives(&paths.cache_dir, &filename) {
+        log::warn!("old Node.js archives could not be pruned: {error}");
+    }
     if node_version(paths, &paths.node_dir).as_deref() == Some(version.as_str()) {
         return Ok(None);
     }
-    let filename = node_filename(&version)?;
     let checksum = node_checksum(&filename)?;
     let archive = paths.cache_dir.join(&filename);
     activity(
@@ -534,14 +541,33 @@ fn install_harness(
     controller: &DeploymentController,
     notify: &impl Fn(DeploymentEvent),
 ) -> AppResult<PathBuf> {
+    let staging = paths
+        .runtime_dir
+        .join(format!("dsh.staging-{}", Uuid::new_v4()));
+    let result = install_harness_into(paths, &staging, version, controller, notify);
+    if result.is_err()
+        && let Err(error) = cleanup_failed_staging(&staging, controller)
+    {
+        return Err(error);
+    }
+    if controller.cleanup_error().is_none() {
+        prune_oversized_npm_cache(paths);
+    }
+    result
+}
+
+fn install_harness_into(
+    paths: &ApplicationPaths,
+    staging: &Path,
+    version: &str,
+    controller: &DeploymentController,
+    notify: &impl Fn(DeploymentEvent),
+) -> AppResult<PathBuf> {
     activity(
         notify,
         ActivityCode::CheckingSources,
         [("version", version.to_owned())],
     );
-    let staging = paths
-        .runtime_dir
-        .join(format!("dsh.staging-{}", Uuid::new_v4()));
     let client = http_client()?;
     let expected = Version::parse(version)
         .map_err(|_| AppError::new("runtimeVersionInvalid").value("version", version))?;
@@ -552,13 +578,19 @@ fn install_harness(
         &expected,
         preferred_registry.as_deref().map(str::trim),
     )?;
+    let seed_version = installed_version(paths).filter(|installed| {
+        dsh_valid(paths, &paths.node_dir, &paths.dsh_dir, installed)
+            && runtime_seed_has_space(paths)
+    });
     for registry in registries {
         controller.check()?;
-        let _ = remove_owned(&staging);
-        fs::create_dir(&staging)?;
-        atomic_write(
-            &staging.join("package.json"),
-            b"{\"name\":\"dsh-runtime\",\"private\":true}\n",
+        prepare_harness_staging(
+            paths,
+            staging,
+            seed_version.as_deref(),
+            version,
+            controller,
+            notify,
         )?;
         activity(
             notify,
@@ -591,8 +623,8 @@ fn install_harness(
         isolated_command(&mut command, paths);
         command
             .env("NPM_CONFIG_REGISTRY", &registry)
-            .current_dir(&staging);
-        mark_npm_cache_used(paths);
+            .current_dir(staging);
+        ensure_npm_cache(paths)?;
         let mut npm_activity = NpmInstallActivity::new(version, &registry);
         let install_result = run_logged(
             &mut command,
@@ -610,15 +642,15 @@ fn install_harness(
                     ActivityCode::ValidatingHarness,
                     [("version", version.to_owned())],
                 );
-                fix_spawn_helper(&staging);
-                if dsh_valid(paths, &paths.node_dir, &staging, version) {
+                fix_spawn_helper(staging);
+                if dsh_valid(paths, &paths.node_dir, staging, version) {
                     if let Err(error) = atomic_write(
                         &paths.cache_dir.join("npm.registry"),
                         format!("{registry}\n").as_bytes(),
                     ) {
                         log::warn!("preferred npm registry could not be saved: {error}");
                     }
-                    return Ok(staging);
+                    return Ok(staging.to_owned());
                 }
             }
             Err(error) if error.code == "deploymentCancelled" => return Err(error),
@@ -629,8 +661,248 @@ fn install_harness(
             Err(_) => {}
         }
     }
-    let _ = remove_owned(&staging);
     Err(AppError::new("installFailed").value("log", paths.install_log.display()))
+}
+
+fn cleanup_failed_staging(staging: &Path, controller: &DeploymentController) -> AppResult<()> {
+    if let Err(error) = remove_owned(staging) {
+        controller.record_cleanup_error(error.clone());
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn runtime_seed_has_space(paths: &ApplicationPaths) -> bool {
+    let source_size = match owned_tree_size(&paths.dsh_dir) {
+        Ok(size) => size,
+        Err(error) => {
+            log::warn!(
+                "Harness runtime size could not be measured; using a fresh candidate: {error}"
+            );
+            return false;
+        }
+    };
+    let available = match fs2::available_space(&paths.runtime_dir) {
+        Ok(available) => available,
+        Err(error) => {
+            log::warn!("free disk space could not be measured; using a fresh candidate: {error}");
+            return false;
+        }
+    };
+    let required = source_size.saturating_add(RUNTIME_COPY_RESERVE_BYTES);
+    if !has_runtime_seed_capacity(source_size, available) {
+        log::warn!(
+            "skipping Harness runtime reuse: {available} bytes available, {required} bytes required"
+        );
+        return false;
+    }
+    true
+}
+
+fn has_runtime_seed_capacity(source_size: u64, available: u64) -> bool {
+    available >= source_size.saturating_add(RUNTIME_COPY_RESERVE_BYTES)
+}
+
+fn prepare_harness_staging(
+    paths: &ApplicationPaths,
+    staging: &Path,
+    seed_version: Option<&str>,
+    target_version: &str,
+    controller: &DeploymentController,
+    notify: &impl Fn(DeploymentEvent),
+) -> AppResult<()> {
+    remove_owned(staging)?;
+    if let Some(seed_version) = seed_version {
+        activity(
+            notify,
+            ActivityCode::CopyingHarnessRuntime,
+            [
+                ("fromVersion", seed_version.to_owned()),
+                ("version", target_version.to_owned()),
+                ("processed", "0".to_owned()),
+            ],
+        );
+        match copy_runtime_candidate(&paths.dsh_dir, staging, controller, |processed| {
+            notify(DeploymentEvent::ActivityUpdate {
+                values: BTreeMap::from([
+                    ("fromVersion".to_owned(), seed_version.to_owned()),
+                    ("version".to_owned(), target_version.to_owned()),
+                    ("processed".to_owned(), processed.to_string()),
+                ]),
+            });
+        }) {
+            Ok(processed) => {
+                log::info!(
+                    "copied {processed} entries from Harness {seed_version} into the update candidate"
+                );
+                return Ok(());
+            }
+            Err(error) if error.code == "deploymentCancelled" => return Err(error),
+            Err(error) => {
+                log::warn!(
+                    "the installed Harness runtime could not seed the update candidate; using a fresh candidate: {error}"
+                );
+                remove_owned(staging)?;
+            }
+        }
+    }
+
+    fs::create_dir(staging)?;
+    atomic_write(
+        &staging.join("package.json"),
+        b"{\"name\":\"dsh-runtime\",\"private\":true}\n",
+    )
+}
+
+fn copy_runtime_candidate(
+    source: &Path,
+    destination: &Path,
+    controller: &DeploymentController,
+    mut progress: impl FnMut(u64),
+) -> AppResult<u64> {
+    let source_metadata = fs::symlink_metadata(source)?;
+    if !source_metadata.is_dir() || source_metadata.file_type().is_symlink() {
+        return Err(AppError::new("runtimeSeedUnsafe"));
+    }
+    fs::create_dir(destination)?;
+    let mut copied = 0_u64;
+    let hidden_lock = source.join("node_modules/.package-lock.json");
+    let result = copy_runtime_children(
+        source,
+        source,
+        destination,
+        &hidden_lock,
+        controller,
+        &mut copied,
+        &mut progress,
+    )
+    .and_then(|()| {
+        if hidden_lock.exists() && !hidden_lock.is_symlink() {
+            copy_runtime_file(
+                &hidden_lock,
+                &destination.join("node_modules/.package-lock.json"),
+                &mut copied,
+                &mut progress,
+            )?;
+        }
+        fs::set_permissions(destination, source_metadata.permissions())?;
+        progress(copied);
+        Ok(copied)
+    });
+    match result {
+        Ok(copied) => Ok(copied),
+        Err(error) => {
+            let _ = remove_owned(destination);
+            Err(error)
+        }
+    }
+}
+
+fn copy_runtime_children(
+    root: &Path,
+    source: &Path,
+    destination: &Path,
+    hidden_lock: &Path,
+    controller: &DeploymentController,
+    copied: &mut u64,
+    progress: &mut impl FnMut(u64),
+) -> AppResult<()> {
+    for entry in fs::read_dir(source)? {
+        controller.check()?;
+        let entry = entry?;
+        let source_path = entry.path();
+        if source_path == hidden_lock {
+            continue;
+        }
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)?;
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&source_path)?;
+            let directory = validate_runtime_symlink(root, &source_path, &target)?;
+            create_runtime_symlink(&target, &destination_path, directory)?;
+            include_runtime_copy_progress(copied, progress);
+        } else if metadata.is_dir() {
+            fs::create_dir(&destination_path)?;
+            copy_runtime_children(
+                root,
+                &source_path,
+                &destination_path,
+                hidden_lock,
+                controller,
+                copied,
+                progress,
+            )?;
+            fs::set_permissions(&destination_path, metadata.permissions())?;
+            include_runtime_copy_progress(copied, progress);
+        } else if metadata.is_file() {
+            copy_runtime_file(&source_path, &destination_path, copied, progress)?;
+        } else {
+            return Err(AppError::new("runtimeSeedUnsafe").value("entry", source_path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn copy_runtime_file(
+    source: &Path,
+    destination: &Path,
+    copied: &mut u64,
+    progress: &mut impl FnMut(u64),
+) -> AppResult<()> {
+    fs::copy(source, destination)?;
+    fs::set_permissions(destination, fs::metadata(source)?.permissions())?;
+    include_runtime_copy_progress(copied, progress);
+    Ok(())
+}
+
+fn include_runtime_copy_progress(copied: &mut u64, progress: &mut impl FnMut(u64)) {
+    *copied = copied.saturating_add(1);
+    if *copied == 1 || (*copied).is_multiple_of(256) {
+        progress(*copied);
+    }
+}
+
+fn validate_runtime_symlink(root: &Path, link: &Path, target: &Path) -> AppResult<bool> {
+    if target.is_absolute() {
+        return Err(AppError::new("runtimeSeedUnsafe").value("entry", link.display()));
+    }
+    let relative_parent = link
+        .parent()
+        .and_then(|parent| parent.strip_prefix(root).ok())
+        .ok_or_else(|| AppError::new("runtimeSeedUnsafe").value("entry", link.display()))?;
+    let mut normalized = PathBuf::new();
+    for component in relative_parent.join(target).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => normalized.push(value),
+            Component::ParentDir if normalized.pop() => {}
+            _ => {
+                return Err(AppError::new("runtimeSeedUnsafe").value("entry", link.display()));
+            }
+        }
+    }
+    let canonical_root = fs::canonicalize(root)?;
+    let canonical_target = fs::canonicalize(root.join(normalized))?;
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err(AppError::new("runtimeSeedUnsafe").value("entry", link.display()));
+    }
+    Ok(fs::metadata(canonical_target)?.is_dir())
+}
+
+#[cfg(unix)]
+fn create_runtime_symlink(target: &Path, link: &Path, _directory: bool) -> AppResult<()> {
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_runtime_symlink(target: &Path, link: &Path, directory: bool) -> AppResult<()> {
+    if directory {
+        std::os::windows::fs::symlink_dir(target, link)?;
+    } else {
+        std::os::windows::fs::symlink_file(target, link)?;
+    }
+    Ok(())
 }
 
 fn download_verified(
@@ -964,27 +1236,37 @@ fn recover_interrupted(paths: &ApplicationPaths) -> AppResult<()> {
     Ok(())
 }
 
-fn prune_stale_npm_cache(paths: &ApplicationPaths) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if let Err(error) = prune_npm_cache_at(
-        &paths.cache_dir,
-        now,
-        NPM_CACHE_PRUNE_THRESHOLD_BYTES,
-        NPM_CACHE_STALE_AFTER,
-    ) {
-        log::warn!("stale npm cache cleanup was skipped: {error}");
+fn prune_oversized_npm_cache(paths: &ApplicationPaths) {
+    if let Err(error) = prune_npm_cache_at(&paths.cache_dir, NPM_CACHE_PRUNE_THRESHOLD_BYTES) {
+        log::warn!("oversized npm cache cleanup was skipped: {error}");
     }
 }
 
-fn prune_npm_cache_at(
-    cache_dir: &Path,
-    now: u64,
-    threshold: u64,
-    stale_after: Duration,
-) -> AppResult<bool> {
+fn prune_npm_cache_at(cache_dir: &Path, threshold: u64) -> AppResult<bool> {
+    for legacy_marker in ["npm.last-used", "npm.last-prune-check"] {
+        remove_owned(&cache_dir.join(legacy_marker))?;
+    }
+    cleanup_expired_npm_caches(cache_dir)?;
+
+    let npm_cache = cache_dir.join("npm");
+    if !npm_cache.exists() && !npm_cache.is_symlink() {
+        return Ok(false);
+    }
+    if npm_cache.is_symlink() || !npm_cache.is_dir() {
+        remove_owned(&npm_cache)?;
+        return Ok(true);
+    }
+    if owned_tree_size(&npm_cache)? < threshold {
+        return Ok(false);
+    }
+
+    let expired = cache_dir.join(format!("npm.expired-{}", Uuid::new_v4()));
+    fs::rename(&npm_cache, &expired)?;
+    remove_owned(&expired)?;
+    Ok(true)
+}
+
+fn cleanup_expired_npm_caches(cache_dir: &Path) -> AppResult<()> {
     for entry in fs::read_dir(cache_dir)? {
         let entry = entry?;
         if entry
@@ -995,43 +1277,36 @@ fn prune_npm_cache_at(
             remove_owned(&entry.path())?;
         }
     }
+    Ok(())
+}
 
-    let npm_cache = cache_dir.join("npm");
-    if !npm_cache.exists() && !npm_cache.is_symlink() {
-        return Ok(false);
+fn ensure_npm_cache(paths: &ApplicationPaths) -> AppResult<()> {
+    prune_npm_cache_at(&paths.cache_dir, NPM_CACHE_PRUNE_THRESHOLD_BYTES)?;
+    let npm_cache = paths.cache_dir.join("npm");
+    if npm_cache.exists() || npm_cache.is_symlink() {
+        let metadata = fs::symlink_metadata(&npm_cache)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            remove_owned(&npm_cache)?;
+        }
     }
-    let usage_marker = cache_dir.join("npm.last-used");
-    let check_marker = cache_dir.join("npm.last-prune-check");
-    let last_used = fs::read_to_string(&usage_marker)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    let Some(last_used) = last_used else {
-        atomic_write(&usage_marker, format!("{now}\n").as_bytes())?;
-        atomic_write(&check_marker, format!("{now}\n").as_bytes())?;
-        return Ok(false);
-    };
-    if now.saturating_sub(last_used) < stale_after.as_secs() {
-        return Ok(false);
-    }
-    let checked_recently = fs::read_to_string(&check_marker)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .is_some_and(|checked| now.saturating_sub(checked) < NPM_CACHE_CHECK_INTERVAL.as_secs());
-    if checked_recently {
-        return Ok(false);
-    }
-    atomic_write(&check_marker, format!("{now}\n").as_bytes())?;
-    if owned_tree_size(&npm_cache)? < threshold {
-        return Ok(false);
-    }
+    fs::create_dir_all(npm_cache)?;
+    Ok(())
+}
 
-    let expired = cache_dir.join(format!("npm.expired-{}", Uuid::new_v4()));
-    fs::rename(&npm_cache, &expired)?;
-    if let Err(error) = remove_owned(&expired) {
-        log::warn!("expired npm cache will be retried later: {error}");
+fn prune_old_node_archives(cache_dir: &Path, keep: &str) -> AppResult<()> {
+    for entry in fs::read_dir(cache_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let node_archive = name.starts_with("node-v")
+            && (name.ends_with(".tar.gz")
+                || name.ends_with(".zip")
+                || name.ends_with(".gzpart")
+                || name.ends_with(".zippart"));
+        if node_archive && name != keep {
+            remove_owned(&entry.path())?;
+        }
     }
-    atomic_write(&usage_marker, format!("{now}\n").as_bytes())?;
-    Ok(true)
+    Ok(())
 }
 
 fn owned_tree_size(path: &Path) -> AppResult<u64> {
@@ -1052,19 +1327,6 @@ fn owned_tree_size(path: &Path) -> AppResult<u64> {
         }
     }
     Ok(total)
-}
-
-fn mark_npm_cache_used(paths: &ApplicationPaths) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if let Err(error) = atomic_write(
-        &paths.cache_dir.join("npm.last-used"),
-        format!("{now}\n").as_bytes(),
-    ) {
-        log::warn!("npm cache usage marker could not be updated: {error}");
-    }
 }
 
 fn recover_valid_previous(paths: &ApplicationPaths) -> AppResult<()> {
@@ -1238,6 +1500,19 @@ fn run_logged(
     timeouts: ProcessTimeouts,
     controller: &DeploymentController,
     mut observe: impl FnMut(&str, Duration),
+) -> AppResult<()> {
+    trim_log_tail(log_path, INSTALL_LOG_MAX_BYTES)?;
+    let result = run_logged_inner(command, log_path, timeouts, controller, &mut observe);
+    trim_log_tail(log_path, INSTALL_LOG_MAX_BYTES)?;
+    result
+}
+
+fn run_logged_inner(
+    command: &mut Command,
+    log_path: &Path,
+    timeouts: ProcessTimeouts,
+    controller: &DeploymentController,
+    observe: &mut impl FnMut(&str, Duration),
 ) -> AppResult<()> {
     let log = OpenOptions::new()
         .create(true)
@@ -2152,8 +2427,197 @@ mod tests {
     }
 
     #[test]
+    fn runtime_candidate_copy_is_independent_and_keeps_the_hidden_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("active");
+        let destination = temp.path().join("candidate");
+        let package = source.join("node_modules/example");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(source.join("package.json"), b"{\"private\":true}\n").unwrap();
+        fs::write(package.join("value"), b"active").unwrap();
+        fs::write(
+            source.join("node_modules/.package-lock.json"),
+            b"{\"lockfileVersion\":3}\n",
+        )
+        .unwrap();
+        let progress = RefCell::new(Vec::new());
+
+        let copied = copy_runtime_candidate(
+            &source,
+            &destination,
+            &DeploymentController::default(),
+            |value| progress.borrow_mut().push(value),
+        )
+        .unwrap();
+
+        assert!(copied >= 5);
+        assert_eq!(
+            fs::read(destination.join("node_modules/.package-lock.json")).unwrap(),
+            b"{\"lockfileVersion\":3}\n"
+        );
+        fs::write(destination.join("node_modules/example/value"), b"candidate").unwrap();
+        assert_eq!(
+            fs::read(source.join("node_modules/example/value")).unwrap(),
+            b"active"
+        );
+        assert_eq!(progress.borrow().last().copied(), Some(copied));
+    }
+
+    #[test]
+    fn cancelled_runtime_candidate_copy_removes_its_partial_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("active");
+        let destination = temp.path().join("candidate");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("value"), b"active").unwrap();
+        let controller = DeploymentController::default();
+        controller.cancel();
+
+        let error = copy_runtime_candidate(&source, &destination, &controller, |_| {}).unwrap_err();
+
+        assert_eq!(error.code, "deploymentCancelled");
+        assert!(!destination.exists());
+        assert_eq!(fs::read(source.join("value")).unwrap(), b"active");
+    }
+
+    #[test]
+    fn failed_staging_is_removed_immediately() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path().join("dsh.staging-failed");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("partial"), b"candidate").unwrap();
+        let controller = DeploymentController::default();
+
+        cleanup_failed_staging(&staging, &controller).unwrap();
+
+        assert!(!staging.exists());
+        assert!(controller.cleanup_error().is_none());
+    }
+
+    #[test]
+    fn startup_recovery_removes_every_stale_candidate_and_failed_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        for name in [
+            "dsh.staging-one",
+            "dsh.staging-two",
+            "node.staging-one",
+            "dsh.failed-one",
+        ] {
+            fs::create_dir(paths.runtime_dir.join(name)).unwrap();
+        }
+
+        recover_interrupted(&paths).unwrap();
+
+        for name in [
+            "dsh.staging-one",
+            "dsh.staging-two",
+            "node.staging-one",
+            "dsh.failed-one",
+        ] {
+            assert!(!paths.runtime_dir.join(name).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_recovery_removes_a_candidate_link_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"user-data").unwrap();
+        symlink(&outside, paths.runtime_dir.join("dsh.staging-link")).unwrap();
+
+        recover_interrupted(&paths).unwrap();
+
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"user-data");
+        assert!(!paths.runtime_dir.join("dsh.staging-link").is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_runtime_link_falls_back_to_a_fresh_candidate() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"user-data").unwrap();
+        fs::create_dir_all(paths.dsh_dir.join("node_modules")).unwrap();
+        symlink(&outside, paths.dsh_dir.join("node_modules/external")).unwrap();
+        let staging = paths.runtime_dir.join("dsh.staging-test");
+
+        prepare_harness_staging(
+            &paths,
+            &staging,
+            Some("0.1.0-rc.7"),
+            "0.1.1-rc.1",
+            &DeploymentController::default(),
+            &|_| {},
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"user-data");
+        assert!(!staging.join("node_modules/external").exists());
+        assert_eq!(
+            fs::read(staging.join("package.json")).unwrap(),
+            b"{\"name\":\"dsh-runtime\",\"private\":true}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_candidate_copy_preserves_safe_relative_links() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("active");
+        let destination = temp.path().join("candidate");
+        fs::create_dir_all(source.join("node_modules/.bin")).unwrap();
+        fs::create_dir_all(source.join("node_modules/example/bin")).unwrap();
+        fs::write(source.join("node_modules/example/bin/cli.js"), b"cli").unwrap();
+        symlink(
+            "../example/bin/cli.js",
+            source.join("node_modules/.bin/example"),
+        )
+        .unwrap();
+
+        copy_runtime_candidate(
+            &source,
+            &destination,
+            &DeploymentController::default(),
+            |_| {},
+        )
+        .unwrap();
+
+        let copied_link = destination.join("node_modules/.bin/example");
+        assert!(
+            fs::symlink_metadata(&copied_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(copied_link).unwrap(),
+            PathBuf::from("../example/bin/cli.js")
+        );
+    }
+
+    #[test]
     fn run_logged_streams_appended_output_to_the_observer() {
         let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("install.log");
+        File::create(&log_path)
+            .unwrap()
+            .set_len(INSTALL_LOG_MAX_BYTES + 1024)
+            .unwrap();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -2166,7 +2630,7 @@ mod tests {
 
         run_logged(
             &mut command,
-            &temp.path().join("install.log"),
+            &log_path,
             ProcessTimeouts {
                 total: Duration::from_secs(10),
             },
@@ -2182,6 +2646,7 @@ mod tests {
         let observed = observed.into_inner();
         assert!(observed.iter().any(|chunk| chunk.contains("first-output")));
         assert!(observed.iter().any(|chunk| chunk.contains("second-output")));
+        assert!(fs::metadata(log_path).unwrap().len() <= INSTALL_LOG_MAX_BYTES);
     }
 
     #[test]
@@ -2197,39 +2662,34 @@ mod tests {
     }
 
     #[test]
-    fn stale_npm_cache_is_pruned_only_after_reaching_the_limit() {
+    fn npm_cache_is_pruned_as_soon_as_it_reaches_the_limit() {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join("cache");
         let npm = cache.join("npm");
         fs::create_dir_all(&npm).unwrap();
         fs::write(npm.join("cached-package"), [0_u8; 8]).unwrap();
-        fs::write(cache.join("npm.last-used"), "100\n").unwrap();
 
-        assert!(!prune_npm_cache_at(&cache, 200, 9, Duration::from_secs(10)).unwrap());
+        assert!(!prune_npm_cache_at(&cache, 9).unwrap());
         assert!(npm.exists());
-        assert!(
-            prune_npm_cache_at(
-                &cache,
-                200 + NPM_CACHE_CHECK_INTERVAL.as_secs(),
-                8,
-                Duration::from_secs(10),
-            )
-            .unwrap()
-        );
+        assert!(prune_npm_cache_at(&cache, 8).unwrap());
         assert!(!npm.exists());
     }
 
     #[test]
-    fn recently_used_npm_cache_is_preserved_even_at_the_limit() {
+    fn npm_cache_preparation_removes_interrupted_cleanup_before_reuse() {
         let temp = tempfile::tempdir().unwrap();
-        let cache = temp.path().join("cache");
-        let npm = cache.join("npm");
-        fs::create_dir_all(&npm).unwrap();
-        fs::write(npm.join("cached-package"), [0_u8; 8]).unwrap();
-        fs::write(cache.join("npm.last-used"), "195\n").unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        let expired = paths.cache_dir.join("npm.expired-interrupted");
+        fs::create_dir(&expired).unwrap();
+        fs::write(expired.join("cached-package"), b"old-cache").unwrap();
+        fs::write(paths.cache_dir.join("npm.last-used"), b"legacy-marker").unwrap();
 
-        assert!(!prune_npm_cache_at(&cache, 200, 8, Duration::from_secs(10)).unwrap());
-        assert!(npm.exists());
+        ensure_npm_cache(&paths).unwrap();
+
+        assert!(!expired.exists());
+        assert!(!paths.cache_dir.join("npm.last-used").exists());
+        assert!(paths.cache_dir.join("npm").is_dir());
     }
 
     #[cfg(unix)]
@@ -2245,10 +2705,57 @@ mod tests {
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("keep"), b"user-data").unwrap();
         symlink(&outside, npm.join("external-link")).unwrap();
-        fs::write(cache.join("npm.last-used"), "100\n").unwrap();
 
-        assert!(prune_npm_cache_at(&cache, 200, 1, Duration::from_secs(10)).unwrap());
+        assert!(prune_npm_cache_at(&cache, 1).unwrap());
         assert_eq!(fs::read(outside.join("keep")).unwrap(), b"user-data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_cache_root_link_is_replaced_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"user-data").unwrap();
+        symlink(&outside, paths.cache_dir.join("npm")).unwrap();
+
+        ensure_npm_cache(&paths).unwrap();
+
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"user-data");
+        let metadata = fs::symlink_metadata(paths.cache_dir.join("npm")).unwrap();
+        assert!(metadata.is_dir());
+        assert!(!metadata.file_type().is_symlink());
+    }
+
+    #[test]
+    fn old_node_archives_and_partial_downloads_are_pruned() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path();
+        let keep = "node-v24.19.0-win-x64.zip";
+        fs::write(cache.join(keep), b"current").unwrap();
+        fs::write(cache.join("node-v22.0.0-win-x64.zip"), b"old").unwrap();
+        fs::write(cache.join("node-v22.0.0-darwin-x64.tar.gzpart"), b"partial").unwrap();
+        fs::write(cache.join("unrelated"), b"keep").unwrap();
+
+        prune_old_node_archives(cache, keep).unwrap();
+
+        assert!(cache.join(keep).exists());
+        assert!(!cache.join("node-v22.0.0-win-x64.zip").exists());
+        assert!(!cache.join("node-v22.0.0-darwin-x64.tar.gzpart").exists());
+        assert!(cache.join("unrelated").exists());
+    }
+
+    #[test]
+    fn runtime_copy_requires_space_for_the_copy_and_install_reserve() {
+        let source = 256 * 1024 * 1024;
+        let required = source + RUNTIME_COPY_RESERVE_BYTES;
+
+        assert!(!has_runtime_seed_capacity(source, required - 1));
+        assert!(has_runtime_seed_capacity(source, required));
     }
 
     #[test]
@@ -2267,6 +2774,33 @@ mod tests {
         );
         rollback_directory(&active, previous.as_deref()).unwrap();
         assert_eq!(fs::read_to_string(active.join("value")).unwrap(), "old");
+    }
+
+    #[test]
+    fn repeated_publication_keeps_only_active_and_one_previous_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("dsh");
+        fs::create_dir(&active).unwrap();
+        fs::write(active.join("version"), "one").unwrap();
+
+        for version in ["two", "three", "four"] {
+            let staging = temp.path().join(format!("dsh.staging-{version}"));
+            fs::create_dir(&staging).unwrap();
+            fs::write(staging.join("version"), version).unwrap();
+            publish_directory(&staging, &active).unwrap();
+        }
+
+        assert_eq!(fs::read_to_string(active.join("version")).unwrap(), "four");
+        assert_eq!(
+            fs::read_to_string(temp.path().join("dsh.previous/version")).unwrap(),
+            "three"
+        );
+        let runtime_directories = fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .count();
+        assert_eq!(runtime_directories, 2);
     }
 
     #[test]

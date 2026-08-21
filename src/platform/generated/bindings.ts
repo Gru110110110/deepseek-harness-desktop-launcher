@@ -24,6 +24,7 @@ export type ActivityCode =
   | "downloadingNode"
   | "verifyingNode"
   | "checkingSources"
+  | "copyingHarnessRuntime"
   | "installingHarness"
   | "resolvingHarnessDependencies"
   | "downloadingHarnessPackages"
