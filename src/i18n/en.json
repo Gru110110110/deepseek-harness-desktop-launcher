@@ -61,7 +61,7 @@
   "activity.resolvingHarnessDependencies": "Resolving Harness dependencies via {{source}}, {{processed}} processed · {{elapsed}}",
   "activity.downloadingHarnessPackages": "Fetching packages via {{source}}, {{processed}} processed · {{elapsed}}",
   "activity.writingHarnessRuntime": "Writing the Harness runtime, {{processed}} components installed · {{elapsed}}",
-  "activity.installingHarnessWaiting": "npm has no new output; waiting for the network or disk · {{elapsed}}",
+  "activity.installingHarnessWaiting": "npm has no new output; it may still be resolving dependencies or waiting for network or disk · {{elapsed}}",
   "activity.validatingHarness": "Validating Harness {{version}} · {{elapsed}}",
   "activity.activatingHarness": "Activating Harness {{version}} · {{elapsed}}",
   "activity.migratingData": "Backing up, verifying, and importing local data · {{elapsed}}",

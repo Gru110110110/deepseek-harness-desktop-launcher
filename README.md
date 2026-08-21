@@ -13,7 +13,7 @@ The application uses React for presentation, a narrow Tauri command/event adapte
 - Pinned Node.js 24.19.0 archives admitted only by platform-specific SHA-256
 - Exact `@deepseek-ai/dsh` installation; the first npm registry remains the version authority, the first install prefers the fastest source confirmed to carry that version, and later installs keep the successful source for cache reuse
 - Transactional staging, executable smoke checks, atomic publication, startup recovery, and rollback
-- Live Harness installation phases for dependency resolution, package fetching, runtime writes, validation, and activation; prolonged npm silence is shown as a waiting state, and an idle timeout distinguishes slow work from a real stall
+- Live Harness installation phases for dependency resolution, package fetching, runtime writes, validation, and activation; prolonged npm silence explains that dependency calculation may still be active instead of treating missing log output as proof of a stall
 - Browser selection, system tray lifecycle, English/Simplified Chinese, and light/dark/system themes
 - Separate Harness updates and cryptographically signed desktop updates; both check automatically, can be checked from their sidebar version rows, and remain independently actionable when both have releases available
 

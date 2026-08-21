@@ -35,7 +35,6 @@ const MAX_NODE_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
 const NPM_CACHE_PRUNE_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
 const NPM_CACHE_STALE_AFTER: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const NPM_CACHE_CHECK_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const NPM_PROCESS_IDLE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 const NPM_PROCESS_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const NPM_WAITING_AFTER: Duration = Duration::from_secs(30);
 const RELEASE_SOURCE_ATTEMPTS: usize = 3;
@@ -334,6 +333,10 @@ impl NpmInstallActivity {
                     self.resolved = self.resolved.saturating_add(1);
                     self.phase = self.phase.max(NpmInstallPhase::Resolving);
                 }
+                if line.contains("silly placeDep ") {
+                    self.resolved = self.resolved.saturating_add(1);
+                    self.phase = self.phase.max(NpmInstallPhase::Resolving);
+                }
                 if (line.contains("http fetch ") || line.contains("http cache "))
                     && line.contains(".tgz")
                 {
@@ -591,33 +594,39 @@ fn install_harness(
             .current_dir(&staging);
         mark_npm_cache_used(paths);
         let mut npm_activity = NpmInstallActivity::new(version, &registry);
-        if run_logged(
+        let install_result = run_logged(
             &mut command,
             &paths.install_log,
             ProcessTimeouts {
-                idle: NPM_PROCESS_IDLE_TIMEOUT,
                 total: NPM_PROCESS_TOTAL_TIMEOUT,
             },
             controller,
             |output, idle| npm_activity.observe(output, idle, notify),
-        )
-        .is_ok()
-        {
-            activity(
-                notify,
-                ActivityCode::ValidatingHarness,
-                [("version", version.to_owned())],
-            );
-            fix_spawn_helper(&staging);
-            if dsh_valid(paths, &paths.node_dir, &staging, version) {
-                if let Err(error) = atomic_write(
-                    &paths.cache_dir.join("npm.registry"),
-                    format!("{registry}\n").as_bytes(),
-                ) {
-                    log::warn!("preferred npm registry could not be saved: {error}");
+        );
+        match install_result {
+            Ok(()) => {
+                activity(
+                    notify,
+                    ActivityCode::ValidatingHarness,
+                    [("version", version.to_owned())],
+                );
+                fix_spawn_helper(&staging);
+                if dsh_valid(paths, &paths.node_dir, &staging, version) {
+                    if let Err(error) = atomic_write(
+                        &paths.cache_dir.join("npm.registry"),
+                        format!("{registry}\n").as_bytes(),
+                    ) {
+                        log::warn!("preferred npm registry could not be saved: {error}");
+                    }
+                    return Ok(staging);
                 }
-                return Ok(staging);
             }
+            Err(error) if error.code == "deploymentCancelled" => return Err(error),
+            // Registry fallback helps transport failures, but it cannot make
+            // npm's local peer-dependency solver faster. Do not repeat a full
+            // 30-minute resolution timeout against an equivalent source.
+            Err(error) if error.code == "processTimeout" => break,
+            Err(_) => {}
         }
     }
     let _ = remove_owned(&staging);
@@ -1220,7 +1229,6 @@ fn dsh_manifest_version(dir: &Path) -> Option<String> {
 
 #[derive(Debug, Clone, Copy)]
 struct ProcessTimeouts {
-    idle: Duration,
     total: Duration,
 }
 
@@ -1259,10 +1267,7 @@ fn run_logged(
             observe(&output, now.duration_since(last_output));
             last_observation = now;
         }
-        if controller.check().is_err()
-            || now.duration_since(started) >= timeouts.total
-            || now.duration_since(last_output) >= timeouts.idle
-        {
+        if controller.check().is_err() || now.duration_since(started) >= timeouts.total {
             #[cfg(unix)]
             stop_unix_command_tree(&mut child, controller)?;
             #[cfg(windows)]
@@ -2163,7 +2168,6 @@ mod tests {
             &mut command,
             &temp.path().join("install.log"),
             ProcessTimeouts {
-                idle: Duration::from_secs(5),
                 total: Duration::from_secs(10),
             },
             &DeploymentController::default(),
