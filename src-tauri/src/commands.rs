@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use dsh_core::{AppError, Language, LauncherSnapshot, ThemePreference};
+use dsh_core::{AppError, HarnessUpdateMode, Language, LauncherSnapshot, ThemePreference};
 use tauri::{AppHandle, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
@@ -12,8 +12,8 @@ pub fn launcher_get_snapshot(state: State<'_, Arc<AppState>>) -> LauncherSnapsho
 }
 
 #[tauri::command]
-pub fn launcher_retry(state: State<'_, Arc<AppState>>) {
-    state.inner().start(false, None);
+pub fn launcher_retry(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
+    state.inner().start(false, None)
 }
 
 #[tauri::command]
@@ -33,8 +33,20 @@ pub async fn launcher_restart(state: State<'_, Arc<AppState>>) -> Result<(), App
 }
 
 #[tauri::command]
-pub fn launcher_update_harness(state: State<'_, Arc<AppState>>) {
-    state.inner().update_harness();
+pub fn launcher_update_harness(
+    mode: HarnessUpdateMode,
+    expected_version: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), AppError> {
+    state.inner().update_harness(mode, expected_version)
+}
+
+#[tauri::command]
+pub fn launcher_activate_harness_update(
+    expected_version: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), AppError> {
+    state.inner().activate_harness_update(expected_version)
 }
 
 #[tauri::command]

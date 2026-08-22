@@ -737,6 +737,80 @@ button:disabled {
   cursor: pointer;
 }
 
+.modal-overlay {
+  position: fixed;
+  z-index: 200;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(10 18 32 / 48%);
+  backdrop-filter: blur(3px);
+}
+
+.update-modal {
+  width: min(480px, 100%);
+  padding: 22px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: 0 24px 70px rgb(0 0 0 / 28%);
+}
+
+.update-modal h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 18px;
+}
+
+.update-modal > p {
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.update-mode-options {
+  display: grid;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.update-mode-option {
+  display: grid;
+  gap: 5px;
+  width: 100%;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-raised, var(--surface));
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.update-mode-option:hover {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
+.update-mode-option strong {
+  font-size: 13px;
+}
+
+.update-mode-option span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 20px;
+}
+
 .dropdown-content {
   z-index: 100;
   min-width: 180px;

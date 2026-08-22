@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  HarnessUpdateMode,
   Language,
   LauncherSnapshot,
   ThemePreference,
@@ -18,7 +19,10 @@ export const launcherApi = {
   restart: () => action("launcher_restart"),
   checkHarnessUpdate: () =>
     command<string | null>("launcher_check_harness_update"),
-  updateHarness: () => action("launcher_update_harness"),
+  updateHarness: (mode: HarnessUpdateMode, expectedVersion: string) =>
+    action("launcher_update_harness", { mode, expectedVersion }),
+  activateHarnessUpdate: (expectedVersion: string) =>
+    action("launcher_activate_harness_update", { expectedVersion }),
   approveMigration: () => action("migration_approve"),
   skipMigration: () => action("migration_skip"),
   selectBrowser: (browserId: string) =>

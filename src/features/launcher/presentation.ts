@@ -69,6 +69,16 @@ export function getHarnessUpdateNotice(
         tone: "error",
         actionLabel: "action.retryUpdate",
       };
+    case "downloaded":
+      return {
+        message: {
+          key: "update.harness.downloaded",
+          values: { version: harness.version },
+        },
+        tone: "info",
+        actionLabel: "action.restartAndUpdate",
+      };
+    case "downloading":
     case "installing":
     case "checking":
     case "none":

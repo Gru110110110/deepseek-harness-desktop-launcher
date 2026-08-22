@@ -1,9 +1,9 @@
 use std::{env, fs, path::PathBuf};
 
 use dsh_core::{
-    ActivityCode, ActivityState, AppError, BrowserChoice, DesktopUpdateState, HarnessUpdateState,
-    Language, LauncherPhase, LauncherSnapshot, LauncherStep, MigrationPlan, MigrationState,
-    ProgressState, ThemePreference,
+    ActivityCode, ActivityState, AppError, BrowserChoice, DesktopUpdateState, HarnessUpdateMode,
+    HarnessUpdateState, Language, LauncherPhase, LauncherSnapshot, LauncherStep, MigrationPlan,
+    MigrationState, ProgressState, ThemePreference,
 };
 use ts_rs::TS;
 
@@ -24,6 +24,7 @@ fn main() {
         AppError::decl(),
         DesktopUpdateState::decl(),
         HarnessUpdateState::decl(),
+        HarnessUpdateMode::decl(),
         MigrationPlan::decl(),
         MigrationState::decl(),
         LauncherSnapshot::decl(),

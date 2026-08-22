@@ -74,6 +74,30 @@ describe("launcher presentation", () => {
     });
   });
 
+  it("offers activation after a background update is downloaded", () => {
+    expect(
+      getHarnessUpdateNotice(
+        snapshot({
+          harnessUpdate: { kind: "downloaded", version: "0.1.0-rc.7" },
+        }),
+      ),
+    ).toEqual({
+      message: {
+        key: "update.harness.downloaded",
+        values: { version: "0.1.0-rc.7" },
+      },
+      tone: "info",
+      actionLabel: "action.restartAndUpdate",
+    });
+    expect(
+      getHarnessUpdateNotice(
+        snapshot({
+          harnessUpdate: { kind: "downloading", version: "0.1.0-rc.7" },
+        }),
+      ),
+    ).toBeNull();
+  });
+
   it("labels stopping independently from preparing or starting", () => {
     expect(
       getServiceCopy(snapshot({ phase: "stopping", step: "start" })),

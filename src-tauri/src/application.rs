@@ -1,5 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -10,14 +11,15 @@ use std::{
 
 use dsh_core::{
     ActivityCode, ActivityState, AppError, AppResult, ApplicationPaths, DesktopUpdateState,
-    HarnessUpdateState, Language, LauncherPhase, LauncherSnapshot, LauncherStep, MigrationState,
-    ProgressState, ThemePreference,
+    HarnessUpdateMode, HarnessUpdateState, Language, LauncherPhase, LauncherSnapshot, LauncherStep,
+    MigrationState, ProgressState, ThemePreference,
     browser::BrowserCatalog,
     migration::MigrationService,
     preferences::Preferences,
     runtime::{
-        DeploymentController, DeploymentEvent, deploy_runtime, installed_version,
-        latest_harness_version,
+        DeploymentController, DeploymentEvent, activate_prepared_harness_update, deploy_runtime,
+        discard_prepared_harness_update, installed_version, latest_harness_version,
+        prepare_harness_update, recover_prepared_harness_update,
     },
     service::ServerManager,
 };
@@ -61,10 +63,12 @@ pub(crate) struct AppState {
     browsers: BrowserCatalog,
     server: Mutex<ServerManager>,
     deployment: Mutex<Option<DeploymentController>>,
+    background_update: Mutex<Option<DeploymentController>>,
     migration: MigrationService,
     desktop_update_busy: AtomicBool,
     harness_update_check_busy: AtomicBool,
     startup_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    background_update_thread: Mutex<Option<thread::JoinHandle<()>>>,
     quitting: AtomicBool,
     exit_ready: AtomicBool,
     tray: Mutex<Option<TrayIcon>>,
@@ -85,6 +89,15 @@ impl AppState {
             "system".into()
         };
         snapshot.harness_version = installed_version(&paths);
+        match recover_prepared_harness_update(&paths) {
+            Ok(Some(version)) => {
+                snapshot.harness_update = HarnessUpdateState::Downloaded { version };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                log::warn!("prepared Harness update could not be resumed: {error}");
+            }
+        }
         let migration = MigrationService::from_environment(paths.clone())?;
         Ok(Arc::new(Self {
             app,
@@ -95,10 +108,12 @@ impl AppState {
             preferences: Mutex::new(preferences),
             browsers,
             deployment: Mutex::new(None),
+            background_update: Mutex::new(None),
             migration,
             desktop_update_busy: AtomicBool::new(false),
             harness_update_check_busy: AtomicBool::new(false),
             startup_thread: Mutex::new(None),
+            background_update_thread: Mutex::new(None),
             quitting: AtomicBool::new(false),
             exit_ready: AtomicBool::new(false),
             tray: Mutex::new(None),
@@ -129,8 +144,28 @@ impl AppState {
         true
     }
 
-    pub(crate) fn start(self: &Arc<Self>, force: bool, target_version: Option<String>) {
-        self.start_worker(force, target_version, false);
+    pub(crate) fn start(
+        self: &Arc<Self>,
+        force: bool,
+        target_version: Option<String>,
+    ) -> AppResult<()> {
+        let snapshot = self.snapshot();
+        if !force && let HarnessUpdateState::Downloaded { version } = snapshot.harness_update {
+            return self.start_worker(
+                true,
+                Some(version),
+                false,
+                true,
+                snapshot.phase != LauncherPhase::Stopped,
+            );
+        }
+        self.start_worker(
+            force,
+            target_version,
+            false,
+            false,
+            snapshot.phase != LauncherPhase::Stopped,
+        )
     }
 
     pub(crate) fn stop_service(&self) -> AppResult<()> {
@@ -205,28 +240,69 @@ impl AppState {
         force: bool,
         target_version: Option<String>,
         migration_approved: bool,
-    ) {
+        activate_prepared: bool,
+        restore_service_on_failure: bool,
+    ) -> AppResult<()> {
         if self.quitting.load(Ordering::SeqCst) {
-            return;
+            return Err(AppError::new("deploymentCancelled"));
         }
         let mut slot = self.startup_thread.lock().expect("startup thread poisoned");
         if slot.as_ref().is_some_and(|thread| !thread.is_finished()) {
-            return;
+            return Err(AppError::new("launcherBusy"));
         }
-        if let Some(finished) = slot.take() {
-            let _ = finished.join();
+        if let Some(finished) = slot.take()
+            && finished.join().is_err()
+        {
+            log::error!("launcher startup worker panicked before it was reaped");
         }
+        let previous_update = self.snapshot().harness_update;
         let controller = DeploymentController::default();
         *self.deployment.lock().expect("deployment poisoned") = Some(controller.clone());
+        if self.quitting.load(Ordering::SeqCst) {
+            controller.cancel();
+            *self.deployment.lock().expect("deployment poisoned") = None;
+            return Err(AppError::new("deploymentCancelled"));
+        }
+        if force {
+            self.mutate(|snapshot| {
+                snapshot.harness_update = HarnessUpdateState::Installing {
+                    version: target_version.clone().unwrap_or_else(|| "latest".into()),
+                };
+            });
+        }
         let state = Arc::clone(self);
         let worker = thread::Builder::new()
             .name("launcher-startup".into())
             .spawn(move || {
-                state.run_startup(force, target_version, migration_approved, &controller);
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    state.run_startup(
+                        force,
+                        target_version,
+                        migration_approved,
+                        activate_prepared,
+                        restore_service_on_failure,
+                        &controller,
+                    );
+                }));
                 *state.deployment.lock().expect("deployment poisoned") = None;
-            })
-            .expect("launcher worker spawn failed");
+                if outcome.is_err() && !state.quitting.load(Ordering::SeqCst) {
+                    state.fail(AppError::new("launcherWorkerFailed"));
+                }
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                *self.deployment.lock().expect("deployment poisoned") = None;
+                let failure = AppError::new("launcherWorkerFailed").detail(error.to_string());
+                self.mutate(|snapshot| {
+                    snapshot.harness_update = previous_update;
+                    snapshot.error = Some(failure.clone());
+                });
+                return Err(failure);
+            }
+        };
         *slot = Some(worker);
+        Ok(())
     }
 
     fn run_startup(
@@ -234,6 +310,8 @@ impl AppState {
         force: bool,
         target_version: Option<String>,
         migration_approved: bool,
+        activate_prepared: bool,
+        restore_service_on_failure: bool,
         controller: &DeploymentController,
     ) {
         if self.quitting.load(Ordering::SeqCst) {
@@ -322,58 +400,69 @@ impl AppState {
             return;
         }
         let weak = Arc::downgrade(self);
-        let deployed = deploy_runtime(
-            &self.paths,
-            force,
-            target_version.as_deref(),
-            controller,
-            move |event| {
-                let Some(state) = weak.upgrade() else {
-                    return;
-                };
-                match event {
-                    DeploymentEvent::Activity { code, values } => state.mutate(|snapshot| {
-                        snapshot.activity = Some(ActivityState {
-                            code,
-                            values,
-                            started_at_ms: now_ms(),
-                        });
-                        snapshot.progress = ProgressState::Indeterminate;
-                    }),
-                    DeploymentEvent::Progress { done, total } => state.mutate(|snapshot| {
-                        snapshot.progress = total
-                            .filter(|total| *total > 0)
-                            .map_or(ProgressState::Indeterminate, |total| {
-                                ProgressState::Determinate { done, total }
-                            })
-                    }),
-                    DeploymentEvent::ActivityUpdate { values } => state.mutate(|snapshot| {
-                        if let Some(activity) = snapshot.activity.as_mut() {
-                            activity.values = values;
-                        }
-                    }),
-                }
-            },
-        );
+        let notify = move |event| {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            match event {
+                DeploymentEvent::Activity { code, values } => state.mutate(|snapshot| {
+                    snapshot.activity = Some(ActivityState {
+                        code,
+                        values,
+                        started_at_ms: now_ms(),
+                    });
+                    snapshot.progress = ProgressState::Indeterminate;
+                }),
+                DeploymentEvent::Progress { done, total } => state.mutate(|snapshot| {
+                    snapshot.progress = total
+                        .filter(|total| *total > 0)
+                        .map_or(ProgressState::Indeterminate, |total| {
+                            ProgressState::Determinate { done, total }
+                        })
+                }),
+                DeploymentEvent::ActivityUpdate { values } => state.mutate(|snapshot| {
+                    if let Some(activity) = snapshot.activity.as_mut() {
+                        activity.values = values;
+                    }
+                }),
+            }
+        };
+        let deployed = if activate_prepared {
+            activate_prepared_harness_update(&self.paths, controller, notify)
+        } else {
+            deploy_runtime(
+                &self.paths,
+                force,
+                target_version.as_deref(),
+                controller,
+                notify,
+            )
+        };
         if self.quitting.load(Ordering::SeqCst) {
             return;
         }
         match deployed {
-            Ok(version) => self.mutate(|snapshot| {
-                snapshot.harness_version = Some(version);
-                snapshot.harness_update = HarnessUpdateState::None;
-            }),
+            Ok(version) => {
+                self.mutate(|snapshot| complete_harness_deployment(snapshot, version, force))
+            }
             Err(error) => {
                 if force {
                     self.restore_service_after_failed_update(
                         error,
                         target_version.unwrap_or_else(|| "latest".into()),
+                        restore_service_on_failure,
                     );
                 } else {
                     self.fail_unless_quitting(error);
                 }
                 return;
             }
+        }
+        if force
+            && !activate_prepared
+            && let Err(error) = discard_prepared_harness_update(&self.paths)
+        {
+            log::warn!("obsolete prepared Harness update could not be discarded: {error}");
         }
         self.mutate(|snapshot| {
             snapshot.phase = LauncherPhase::Starting;
@@ -425,15 +514,37 @@ impl AppState {
             snapshot.phase = LauncherPhase::Failed;
             snapshot.error = Some(error);
             snapshot.activity = None;
-            snapshot.harness_update = HarnessUpdateState::None;
+            if let HarnessUpdateState::Installing { version } = &snapshot.harness_update {
+                snapshot.harness_update = HarnessUpdateState::Failed {
+                    version: version.clone(),
+                };
+            }
         });
     }
 
-    fn restore_service_after_failed_update(&self, update_error: AppError, version: String) {
+    fn restore_service_after_failed_update(
+        &self,
+        update_error: AppError,
+        version: String,
+        restore_service: bool,
+    ) {
         if self.quitting.load(Ordering::SeqCst) {
             return;
         }
         log::error!("Harness update failed and was rolled back: {update_error}");
+        if !restore_service {
+            self.mutate(|snapshot| {
+                snapshot.phase = LauncherPhase::Stopped;
+                snapshot.step = LauncherStep::Start;
+                snapshot.activity = None;
+                snapshot.error = Some(update_error);
+                snapshot.web_url = None;
+                snapshot.service_started_at_ms = None;
+                snapshot.harness_version = installed_version(&self.paths);
+                snapshot.harness_update = HarnessUpdateState::Failed { version };
+            });
+            return;
+        }
         let restarted = self.server.lock().expect("server poisoned").start();
         match restarted {
             Ok(url) => self.mutate(|snapshot| {
@@ -466,7 +577,10 @@ impl AppState {
         }
         let _operation = self.begin_harness_update_check()?;
         let previous = snapshot.harness_update;
-        if matches!(&previous, HarnessUpdateState::Installing { .. }) {
+        if matches!(
+            &previous,
+            HarnessUpdateState::Downloading { .. } | HarnessUpdateState::Installing { .. }
+        ) {
             return Err(AppError::new("harnessUpdateBusy"));
         }
         let current_value = snapshot
@@ -504,19 +618,26 @@ impl AppState {
 
         match result {
             Ok(latest) => {
-                let available = Version::parse(&latest)
-                    .ok()
-                    .filter(|latest| latest > &current)
-                    .map(|_| latest);
+                let latest = match Version::parse(&latest) {
+                    Ok(latest) => latest,
+                    Err(_) => {
+                        let error =
+                            AppError::new("runtimeVersionInvalid").value("version", &latest);
+                        let _ = self.mutate_if(|snapshot| {
+                            replace_harness_update_if_checking(snapshot, previous)
+                        });
+                        return Err(error);
+                    }
+                };
+                let replacement = harness_update_after_check(previous, &current, &latest);
+                let available = match &replacement {
+                    HarnessUpdateState::Available { version }
+                    | HarnessUpdateState::Downloaded { version }
+                    | HarnessUpdateState::Failed { version } => Some(version.clone()),
+                    _ => None,
+                };
                 let _ = self.mutate_if(|snapshot| {
-                    replace_harness_update_if_checking(
-                        snapshot,
-                        available
-                            .clone()
-                            .map_or(HarnessUpdateState::None, |version| {
-                                HarnessUpdateState::Available { version }
-                            }),
-                    )
+                    replace_harness_update_if_checking(snapshot, replacement)
                 });
                 Ok(available)
             }
@@ -529,16 +650,189 @@ impl AppState {
         }
     }
 
-    pub(crate) fn update_harness(self: &Arc<Self>) {
-        let target = match self.snapshot().harness_update {
+    pub(crate) fn update_harness(
+        self: &Arc<Self>,
+        mode: HarnessUpdateMode,
+        expected_version: String,
+    ) -> AppResult<()> {
+        let snapshot = self.snapshot();
+        if !matches!(
+            snapshot.phase,
+            LauncherPhase::Ready | LauncherPhase::Stopped
+        ) {
+            return Err(AppError::new("serviceNotReady"));
+        }
+        let target = match snapshot.harness_update {
             HarnessUpdateState::Available { version } | HarnessUpdateState::Failed { version } => {
                 Some(version)
             }
             _ => None,
         };
-        if target.is_some() {
-            self.start(true, target);
+        let Some(target) = target else {
+            return Err(AppError::new("harnessUpdateUnavailable"));
+        };
+        if target != expected_version {
+            return Err(AppError::new("harnessUpdateChanged")
+                .value("expected", expected_version)
+                .value("actual", target));
         }
+        match mode {
+            HarnessUpdateMode::Foreground => self.start(true, Some(target))?,
+            HarnessUpdateMode::Background => self.download_harness_update(target)?,
+        }
+        Ok(())
+    }
+
+    pub(crate) fn activate_harness_update(
+        self: &Arc<Self>,
+        expected_version: String,
+    ) -> AppResult<()> {
+        let snapshot = self.snapshot();
+        if !matches!(
+            snapshot.phase,
+            LauncherPhase::Ready | LauncherPhase::Stopped
+        ) {
+            return Err(AppError::new("serviceNotReady"));
+        }
+        let target = match snapshot.harness_update {
+            HarnessUpdateState::Downloaded { version } => version,
+            _ => return Err(AppError::new("preparedHarnessUpdateUnavailable")),
+        };
+        if target != expected_version {
+            return Err(AppError::new("harnessUpdateChanged")
+                .value("expected", expected_version)
+                .value("actual", target));
+        }
+        self.start_worker(
+            true,
+            Some(target),
+            false,
+            true,
+            snapshot.phase == LauncherPhase::Ready,
+        )
+    }
+
+    fn download_harness_update(self: &Arc<Self>, version: String) -> AppResult<()> {
+        let mut slot = self
+            .background_update_thread
+            .lock()
+            .expect("background update thread poisoned");
+        if slot.as_ref().is_some_and(|worker| !worker.is_finished()) {
+            return Err(AppError::new("harnessUpdateBusy"));
+        }
+        if let Some(finished) = slot.take()
+            && finished.join().is_err()
+        {
+            log::error!("background Harness update worker panicked before it was reaped");
+        }
+        let controller = DeploymentController::default();
+        *self
+            .background_update
+            .lock()
+            .expect("background update poisoned") = Some(controller.clone());
+        if self.quitting.load(Ordering::SeqCst) {
+            controller.cancel();
+            *self
+                .background_update
+                .lock()
+                .expect("background update poisoned") = None;
+            return Err(AppError::new("deploymentCancelled"));
+        }
+        if !self.mutate_if(|snapshot| {
+            if !matches!(
+                snapshot.phase,
+                LauncherPhase::Ready | LauncherPhase::Stopped
+            ) || !matches!(
+                &snapshot.harness_update,
+                HarnessUpdateState::Available { version: available }
+                    | HarnessUpdateState::Failed { version: available }
+                    if available == &version
+            ) {
+                return false;
+            }
+            snapshot.error = None;
+            snapshot.harness_update = HarnessUpdateState::Downloading {
+                version: version.clone(),
+            };
+            true
+        }) {
+            *self
+                .background_update
+                .lock()
+                .expect("background update poisoned") = None;
+            return Err(AppError::new("harnessUpdateBusy"));
+        }
+        let state = Arc::clone(self);
+        let failed_version = version.clone();
+        let worker = thread::Builder::new()
+            .name("harness-background-update".into())
+            .spawn(move || {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    prepare_harness_update(&state.paths, &version, &controller, |_| {})
+                }))
+                .unwrap_or_else(|_| Err(AppError::new("backgroundHarnessUpdateFailed")));
+                *state
+                    .background_update
+                    .lock()
+                    .expect("background update poisoned") = None;
+                if state.quitting.load(Ordering::SeqCst) {
+                    return;
+                }
+                match result {
+                    Ok(downloaded) => {
+                        let _ = state.mutate_if(|snapshot| {
+                            if !matches!(
+                                &snapshot.harness_update,
+                                HarnessUpdateState::Downloading { version: active }
+                                    if active == &version
+                            ) {
+                                return false;
+                            }
+                            snapshot.harness_update = HarnessUpdateState::Downloaded {
+                                version: downloaded,
+                            };
+                            true
+                        });
+                    }
+                    Err(error) => {
+                        log::warn!("background Harness update failed: {error}");
+                        let _ = state.mutate_if(|snapshot| {
+                            if !matches!(
+                                &snapshot.harness_update,
+                                HarnessUpdateState::Downloading { version: active }
+                                    if active == &version
+                            ) {
+                                return false;
+                            }
+                            snapshot.error = Some(error.clone());
+                            snapshot.harness_update = HarnessUpdateState::Failed {
+                                version: version.clone(),
+                            };
+                            true
+                        });
+                    }
+                }
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                *self
+                    .background_update
+                    .lock()
+                    .expect("background update poisoned") = None;
+                let failure =
+                    AppError::new("backgroundHarnessUpdateFailed").detail(error.to_string());
+                self.mutate(|snapshot| {
+                    snapshot.error = Some(failure.clone());
+                    snapshot.harness_update = HarnessUpdateState::Failed {
+                        version: failed_version,
+                    };
+                });
+                return Err(failure);
+            }
+        };
+        *slot = Some(worker);
+        Ok(())
     }
 
     pub(crate) fn approve_migration(self: &Arc<Self>) -> AppResult<()> {
@@ -552,8 +846,7 @@ impl AppState {
             snapshot.migration = MigrationState::Applying { plan };
             snapshot.error = None;
         });
-        self.start_worker(false, None, true);
-        Ok(())
+        self.start_worker(false, None, true, false, true)
     }
 
     pub(crate) fn skip_migration(self: &Arc<Self>) -> AppResult<()> {
@@ -567,8 +860,7 @@ impl AppState {
             snapshot.migration = MigrationState::Skipped;
             snapshot.error = None;
         });
-        self.start_worker(false, None, false);
-        Ok(())
+        self.start_worker(false, None, false, false, true)
     }
 
     pub(crate) fn set_language(&self, language: Language) -> AppResult<()> {
@@ -867,8 +1159,8 @@ impl AppState {
     }
     pub(crate) fn prepare_restart(self: &Arc<Self>) -> AppResult<()> {
         self.quitting.store(true, Ordering::SeqCst);
-        let deployment = self.cancel_deployment();
-        let stopped = self.complete_process_cleanup(deployment);
+        let deployments = self.cancel_deployments();
+        let stopped = self.complete_process_cleanup(deployments);
         match stopped {
             Ok(()) => {
                 self.hide_tray_before_exit();
@@ -885,19 +1177,19 @@ impl AppState {
         if self.quitting.swap(true, Ordering::SeqCst) {
             return;
         }
-        let deployment = self.cancel_deployment();
+        let deployments = self.cancel_deployments();
         self.mutate(|snapshot| snapshot.phase = LauncherPhase::Stopping);
         let state = Arc::clone(self);
         if let Err(error) = thread::Builder::new()
             .name("launcher-shutdown".into())
-            .spawn(move || match state.complete_process_cleanup(deployment) {
+            .spawn(move || match state.complete_process_cleanup(deployments) {
                 Ok(()) => state.exit_after_cleanup(),
                 Err(error) => state.shutdown_failed(error),
             })
         {
             log::error!("shutdown worker could not start: {error}");
-            let deployment = self.cancel_deployment();
-            match self.complete_process_cleanup(deployment) {
+            let deployments = self.cancel_deployments();
+            match self.complete_process_cleanup(deployments) {
                 Ok(()) => self.exit_after_cleanup(),
                 Err(error) => self.shutdown_failed(error),
             }
@@ -926,22 +1218,35 @@ impl AppState {
         }
     }
 
-    fn cancel_deployment(&self) -> Option<DeploymentController> {
-        let controller = self
+    fn cancel_deployments(&self) -> Vec<DeploymentController> {
+        let foreground = self
             .deployment
             .lock()
             .expect("deployment poisoned")
             .as_ref()
             .cloned();
-        if let Some(controller) = controller.as_ref() {
+        let background = self
+            .background_update
+            .lock()
+            .expect("background update poisoned")
+            .as_ref()
+            .cloned();
+        let controllers = [foreground, background]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        for controller in &controllers {
             controller.cancel();
         }
-        controller
+        controllers
     }
 
-    fn complete_process_cleanup(&self, deployment: Option<DeploymentController>) -> AppResult<()> {
+    fn complete_process_cleanup(&self, deployments: Vec<DeploymentController>) -> AppResult<()> {
         self.join_startup();
-        let deployment_error = deployment.and_then(|controller| controller.cleanup_error());
+        self.join_background_update();
+        let deployment_error = deployments
+            .into_iter()
+            .find_map(|controller| controller.cleanup_error());
         self.server.lock().expect("server poisoned").stop()?;
         if let Some(error) = deployment_error {
             return Err(error);
@@ -954,6 +1259,17 @@ impl AppState {
             .startup_thread
             .lock()
             .expect("startup thread poisoned")
+            .take();
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
+    }
+
+    fn join_background_update(&self) {
+        let worker = self
+            .background_update_thread
+            .lock()
+            .expect("background update thread poisoned")
             .take();
         if let Some(worker) = worker {
             let _ = worker.join();
@@ -982,6 +1298,13 @@ fn mark_harness_update_checking(
     }
     snapshot.harness_update = HarnessUpdateState::Checking;
     true
+}
+
+fn complete_harness_deployment(snapshot: &mut LauncherSnapshot, version: String, forced: bool) {
+    snapshot.harness_version = Some(version);
+    if forced {
+        snapshot.harness_update = HarnessUpdateState::None;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1072,6 +1395,29 @@ fn replace_harness_update_if_checking(
         true
     } else {
         false
+    }
+}
+
+fn harness_update_after_check(
+    previous: HarnessUpdateState,
+    current: &Version,
+    latest: &Version,
+) -> HarnessUpdateState {
+    let known_version = match &previous {
+        HarnessUpdateState::Available { version }
+        | HarnessUpdateState::Downloaded { version }
+        | HarnessUpdateState::Failed { version } => Version::parse(version).ok(),
+        _ => None,
+    };
+    if known_version.as_ref().is_some_and(|known| known >= latest) {
+        return previous;
+    }
+    if latest > current {
+        HarnessUpdateState::Available {
+            version: latest.to_string(),
+        }
+    } else {
+        HarnessUpdateState::None
     }
 }
 
@@ -1225,7 +1571,9 @@ pub fn run() {
                 log::warn!("system tray unavailable; closing the window will exit: {error}");
             }
             app.manage(Arc::clone(&state));
-            state.start(false, None);
+            state
+                .start(false, None)
+                .map_err(|error| error.to_string())?;
             tauri::async_runtime::spawn(check_desktop_update_after_startup(state));
             Ok(())
         })
@@ -1258,6 +1606,7 @@ pub fn run() {
             commands::launcher_restart,
             commands::launcher_check_harness_update,
             commands::launcher_update_harness,
+            commands::launcher_activate_harness_update,
             commands::migration_approve,
             commands::migration_skip,
             commands::launcher_select_browser,
@@ -1342,14 +1691,15 @@ mod tests {
         DesktopUpdateDownloadFailure, GITHUB_REPOSITORY, HARNESS_GITHUB_REPOSITORY,
         LifecycleDecision, WEBSITE, acquire_instance_lock, acquire_instance_lock_with_timeout,
         classify_desktop_update_check_error, classify_desktop_update_download_error,
-        desktop_update_check_error, desktop_update_download_error, desktop_update_start_state,
-        external_link_url, lifecycle_decision, mark_harness_update_checking,
-        replace_harness_update_if_checking, retryable_download_http_status,
-        should_retry_desktop_update_download,
+        complete_harness_deployment, desktop_update_check_error, desktop_update_download_error,
+        desktop_update_start_state, external_link_url, harness_update_after_check,
+        lifecycle_decision, mark_harness_update_checking, replace_harness_update_if_checking,
+        retryable_download_http_status, should_retry_desktop_update_download,
     };
     use dsh_core::{
         AppError, ApplicationPaths, DesktopUpdateState, HarnessUpdateState, LauncherSnapshot,
     };
+    use semver::Version;
 
     #[test]
     fn product_website_uses_the_public_homepage() {
@@ -1536,6 +1886,80 @@ mod tests {
             &HarnessUpdateState::None
         ));
         assert_eq!(snapshot.harness_update, HarnessUpdateState::Checking);
+    }
+
+    #[test]
+    fn ordinary_service_start_preserves_a_background_update_state() {
+        let mut snapshot = LauncherSnapshot::initial("0.3.3");
+        snapshot.harness_update = HarnessUpdateState::Downloaded {
+            version: "0.2.0".into(),
+        };
+
+        complete_harness_deployment(&mut snapshot, "0.1.0".into(), false);
+
+        assert_eq!(snapshot.harness_version.as_deref(), Some("0.1.0"));
+        assert_eq!(
+            snapshot.harness_update,
+            HarnessUpdateState::Downloaded {
+                version: "0.2.0".into()
+            }
+        );
+    }
+
+    #[test]
+    fn forced_update_clears_the_completed_update_state() {
+        let mut snapshot = LauncherSnapshot::initial("0.3.3");
+        snapshot.harness_update = HarnessUpdateState::Installing {
+            version: "0.2.0".into(),
+        };
+
+        complete_harness_deployment(&mut snapshot, "0.2.0".into(), true);
+
+        assert_eq!(snapshot.harness_version.as_deref(), Some("0.2.0"));
+        assert_eq!(snapshot.harness_update, HarnessUpdateState::None);
+    }
+
+    #[test]
+    fn update_check_preserves_a_downloaded_candidate_until_a_newer_release_exists() {
+        let current = Version::parse("0.1.0").unwrap();
+        let downloaded = HarnessUpdateState::Downloaded {
+            version: "0.2.0".into(),
+        };
+        assert_eq!(
+            harness_update_after_check(
+                downloaded.clone(),
+                &current,
+                &Version::parse("0.2.0").unwrap()
+            ),
+            downloaded
+        );
+        assert_eq!(
+            harness_update_after_check(
+                HarnessUpdateState::Downloaded {
+                    version: "0.2.0".into()
+                },
+                &current,
+                &Version::parse("0.3.0").unwrap()
+            ),
+            HarnessUpdateState::Available {
+                version: "0.3.0".into()
+            }
+        );
+    }
+
+    #[test]
+    fn stale_registry_result_does_not_erase_a_known_update() {
+        let known = HarnessUpdateState::Available {
+            version: "0.3.0".into(),
+        };
+        assert_eq!(
+            harness_update_after_check(
+                known.clone(),
+                &Version::parse("0.1.0").unwrap(),
+                &Version::parse("0.2.0").unwrap()
+            ),
+            known
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ use base64::Engine;
 use fs2::{FileExt, lock_contended_error};
 use reqwest::blocking::Client;
 use semver::Version;
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
 use uuid::Uuid;
@@ -637,9 +638,6 @@ pub fn deploy_runtime(
                 .ok_or_else(|| AppError::new("runtimeValidationFailed"));
         }
         let previous_version = installed_version(paths);
-        let previous_was_valid = previous_version.as_deref().is_some_and(|version| {
-            runtime_pair_valid(paths, &paths.node_dir, &paths.dsh_dir, version)
-        });
         let version = match target_version {
             Some(value) => Version::parse(value)
                 .map_err(|_| AppError::new("runtimeVersionInvalid").value("version", value))?
@@ -657,7 +655,7 @@ pub fn deploy_runtime(
         let staging = match install_harness(paths, &version, controller, &notify) {
             Ok(staging) => staging,
             Err(error) => {
-                if previous_was_valid && let Some(previous) = node_previous.as_deref() {
+                if let Some(previous) = node_previous.as_deref() {
                     rollback_directory(&paths.node_dir, Some(previous))?;
                 }
                 return Err(error);
@@ -671,7 +669,7 @@ pub fn deploy_runtime(
         let dsh_previous = match publish_directory(&staging, &paths.dsh_dir) {
             Ok(previous) => previous,
             Err(error) => {
-                if previous_was_valid && let Some(previous) = node_previous.as_deref() {
+                if let Some(previous) = node_previous.as_deref() {
                     rollback_directory(&paths.node_dir, Some(previous))?;
                 }
                 return Err(error);
@@ -679,7 +677,7 @@ pub fn deploy_runtime(
         };
         if !dsh_valid(paths, &paths.node_dir, &paths.dsh_dir, &version) {
             rollback_directory(&paths.dsh_dir, dsh_previous.as_deref())?;
-            if previous_was_valid && let Some(previous) = node_previous.as_deref() {
+            if let Some(previous) = node_previous.as_deref() {
                 rollback_directory(&paths.node_dir, Some(previous))?;
             }
             return Err(
@@ -688,13 +686,247 @@ pub fn deploy_runtime(
         }
         if let Err(error) = atomic_write(&paths.version_file, format!("{version}\n").as_bytes()) {
             rollback_directory(&paths.dsh_dir, dsh_previous.as_deref())?;
-            if previous_was_valid && let Some(previous) = node_previous.as_deref() {
+            if let Some(previous) = node_previous.as_deref() {
                 rollback_directory(&paths.node_dir, Some(previous))?;
             }
             if let Some(old) = previous_version {
                 let _ = atomic_write(&paths.version_file, format!("{old}\n").as_bytes());
             }
             return Err(error);
+        }
+        Ok(version)
+    })();
+    let _ = FileExt::unlock(&lock_file);
+    result
+}
+
+#[derive(Debug, Serialize, serde::Deserialize)]
+struct PreparedHarnessUpdate {
+    version: String,
+}
+
+/// Returns a fully installed and validated Harness candidate, if one is ready
+/// to be activated. The candidate never replaces the runtime used by the
+/// current service until `activate_prepared_harness_update` is called.
+pub fn prepared_harness_update(paths: &ApplicationPaths) -> AppResult<Option<String>> {
+    let marker_metadata = match fs::symlink_metadata(&paths.pending_harness_update_file) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let candidate_metadata = match fs::symlink_metadata(&paths.pending_dsh_dir) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if marker_metadata.is_none() && candidate_metadata.is_none() {
+        return Ok(None);
+    }
+    let (Some(marker_metadata), Some(candidate_metadata)) = (marker_metadata, candidate_metadata)
+    else {
+        return Err(AppError::new("preparedHarnessUpdateInvalid"));
+    };
+    if !marker_metadata.is_file() || marker_metadata.file_type().is_symlink() {
+        return Err(AppError::new("preparedHarnessUpdateInvalid"));
+    }
+    if !candidate_metadata.is_dir() || candidate_metadata.file_type().is_symlink() {
+        return Err(AppError::new("preparedHarnessUpdateInvalid"));
+    }
+    let prepared: PreparedHarnessUpdate = serde_json::from_slice(&fs::read(
+        &paths.pending_harness_update_file,
+    )?)
+    .map_err(|error| AppError::new("preparedHarnessUpdateInvalid").detail(error.to_string()))?;
+    Version::parse(&prepared.version).map_err(|_| {
+        AppError::new("preparedHarnessUpdateInvalid").value("version", &prepared.version)
+    })?;
+    if !dsh_valid(
+        paths,
+        &paths.node_dir,
+        &paths.pending_dsh_dir,
+        &prepared.version,
+    ) {
+        return Err(
+            AppError::new("preparedHarnessUpdateInvalid").value("version", &prepared.version)
+        );
+    }
+    Ok(Some(prepared.version))
+}
+
+/// Loads a valid prepared candidate and removes only application-owned,
+/// provably invalid candidate artifacts while holding the deployment lock.
+/// Transient I/O errors preserve the artifacts for a later recovery attempt.
+pub fn recover_prepared_harness_update(paths: &ApplicationPaths) -> AppResult<Option<String>> {
+    paths.ensure_dirs()?;
+    let controller = DeploymentController::default();
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&paths.deployment_lock)?;
+    acquire_lock(&lock_file, &controller)?;
+    let result = match prepared_harness_update(paths) {
+        Ok(Some(prepared)) => {
+            let active_is_same_or_newer = installed_version(paths)
+                .and_then(|active| Version::parse(&active).ok())
+                .zip(Version::parse(&prepared).ok())
+                .is_some_and(|(active, prepared)| active >= prepared);
+            if active_is_same_or_newer {
+                remove_owned(&paths.pending_harness_update_file)?;
+                remove_owned(&paths.pending_dsh_dir)?;
+                Ok(None)
+            } else {
+                Ok(Some(prepared))
+            }
+        }
+        Ok(None) => Ok(None),
+        Err(error) if error.code == "preparedHarnessUpdateInvalid" => {
+            remove_owned(&paths.pending_harness_update_file)?;
+            remove_owned(&paths.pending_dsh_dir)?;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    };
+    let _ = FileExt::unlock(&lock_file);
+    result
+}
+
+/// Removes a prepared runtime candidate after another update path has already
+/// committed a newer active runtime.
+pub fn discard_prepared_harness_update(paths: &ApplicationPaths) -> AppResult<()> {
+    paths.ensure_dirs()?;
+    let controller = DeploymentController::default();
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&paths.deployment_lock)?;
+    acquire_lock(&lock_file, &controller)?;
+    let result = (|| {
+        remove_owned(&paths.pending_harness_update_file)?;
+        remove_owned(&paths.pending_dsh_dir)
+    })();
+    let _ = FileExt::unlock(&lock_file);
+    result
+}
+
+/// Downloads, installs, and validates a Harness update without touching the
+/// active runtime. Only the application-owned pending candidate and marker are
+/// persisted after validation succeeds.
+pub fn prepare_harness_update(
+    paths: &ApplicationPaths,
+    version: &str,
+    controller: &DeploymentController,
+    notify: impl Fn(DeploymentEvent),
+) -> AppResult<String> {
+    let version = Version::parse(version)
+        .map_err(|_| AppError::new("runtimeVersionInvalid").value("version", version))?
+        .to_string();
+    paths.ensure_dirs()?;
+    activity(&notify, ActivityCode::WaitingForLock, []);
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&paths.deployment_lock)?;
+    acquire_lock(&lock_file, controller)?;
+    let result = (|| {
+        recover_interrupted(paths)?;
+        if prepared_harness_update(paths).ok().flatten().as_deref() == Some(version.as_str()) {
+            return Ok(version.clone());
+        }
+        // Invalid or obsolete candidates are application runtime artifacts,
+        // never user data. Remove them only while holding the deployment lock.
+        remove_owned(&paths.pending_harness_update_file)?;
+        remove_owned(&paths.pending_dsh_dir)?;
+
+        let installed = installed_version(paths)
+            .ok_or_else(|| AppError::new("backgroundHarnessUpdateUnavailable"))?;
+        let expected_node = resolve_node_version()?;
+        if node_version(paths, &paths.node_dir).as_deref() != Some(expected_node.as_str())
+            || !runtime_pair_valid(paths, &paths.node_dir, &paths.dsh_dir, &installed)
+        {
+            return Err(AppError::new("backgroundHarnessUpdateUnavailable"));
+        }
+
+        prune_stale_harness_archives(&paths.cache_dir)?;
+        trim_log_tail(&paths.install_log, INSTALL_LOG_MAX_BYTES)?;
+        let staging = install_harness(paths, &version, controller, &notify)?;
+        controller.check()?;
+        if !dsh_valid(paths, &paths.node_dir, &staging, &version) {
+            remove_owned(&staging)?;
+            return Err(
+                AppError::new("runtimeValidationFailed").value("component", "DeepSeek Harness")
+            );
+        }
+        fs::rename(&staging, &paths.pending_dsh_dir)?;
+        let marker = serde_json::to_vec(&PreparedHarnessUpdate {
+            version: version.clone(),
+        })
+        .map_err(|error| AppError::new("writeFailed").detail(error.to_string()))?;
+        if let Err(error) = atomic_write(&paths.pending_harness_update_file, &marker) {
+            let _ = remove_owned(&paths.pending_dsh_dir);
+            return Err(error);
+        }
+        Ok(version.clone())
+    })();
+    let _ = FileExt::unlock(&lock_file);
+    result
+}
+
+/// Atomically switches a previously validated candidate into service. The
+/// previous runtime remains available for rollback until the new version and
+/// version index have both been verified.
+pub fn activate_prepared_harness_update(
+    paths: &ApplicationPaths,
+    controller: &DeploymentController,
+    notify: impl Fn(DeploymentEvent),
+) -> AppResult<String> {
+    paths.ensure_dirs()?;
+    activity(&notify, ActivityCode::WaitingForLock, []);
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&paths.deployment_lock)?;
+    acquire_lock(&lock_file, controller)?;
+    let result = (|| {
+        recover_interrupted(paths)?;
+        let version = prepared_harness_update(paths)?
+            .ok_or_else(|| AppError::new("preparedHarnessUpdateUnavailable"))?;
+        controller.check()?;
+        activity(
+            &notify,
+            ActivityCode::ActivatingHarness,
+            [("version", version.clone())],
+        );
+        let previous_version = installed_version(paths);
+        let previous = publish_directory(&paths.pending_dsh_dir, &paths.dsh_dir)?;
+        if !dsh_valid(paths, &paths.node_dir, &paths.dsh_dir, &version) {
+            rollback_directory(&paths.dsh_dir, previous.as_deref())?;
+            let _ = remove_owned(&paths.pending_harness_update_file);
+            return Err(
+                AppError::new("runtimeValidationFailed").value("component", "DeepSeek Harness")
+            );
+        }
+        if let Err(error) = atomic_write(&paths.version_file, format!("{version}\n").as_bytes()) {
+            rollback_directory(&paths.dsh_dir, previous.as_deref())?;
+            let _ = remove_owned(&paths.pending_harness_update_file);
+            if let Some(previous_version) = previous_version {
+                let _ = atomic_write(
+                    &paths.version_file,
+                    format!("{previous_version}\n").as_bytes(),
+                );
+            }
+            return Err(error);
+        }
+        if let Err(error) = remove_owned(&paths.pending_harness_update_file) {
+            // Activation is already committed and validated. A stale marker is
+            // harmless and will be ignored because its candidate is absent.
+            log::warn!("prepared Harness update marker could not be removed: {error}");
         }
         Ok(version)
     })();
@@ -1734,16 +1966,36 @@ fn publish_directory(staging: &Path, active: &Path) -> AppResult<Option<PathBuf>
             .and_then(|item| item.to_str())
             .unwrap_or("runtime")
     ));
-    remove_owned(&previous)?;
+    let retired = previous.with_file_name(format!(
+        "{}.failed-{}",
+        previous
+            .file_name()
+            .and_then(|item| item.to_str())
+            .unwrap_or("runtime.previous"),
+        Uuid::new_v4()
+    ));
+    let had_previous = previous.exists() || previous.is_symlink();
+    if had_previous {
+        fs::rename(&previous, &retired)?;
+    }
     let moved = active.exists();
-    if moved {
-        fs::rename(active, &previous)?;
+    if moved && let Err(error) = fs::rename(active, &previous) {
+        if had_previous {
+            let _ = fs::rename(&retired, &previous);
+        }
+        return Err(error.into());
     }
     if let Err(error) = fs::rename(staging, active) {
         if moved && !active.exists() {
             let _ = fs::rename(&previous, active);
         }
+        if had_previous && !previous.exists() {
+            let _ = fs::rename(&retired, &previous);
+        }
         return Err(error.into());
+    }
+    if had_previous && let Err(error) = remove_owned(&retired) {
+        log::warn!("retired runtime backup will be cleaned during recovery: {error}");
     }
     Ok(moved.then_some(previous))
 }
@@ -2601,6 +2853,31 @@ mod tests {
     use super::*;
     use std::{cell::RefCell, net::TcpListener, thread};
 
+    #[cfg(unix)]
+    fn write_fake_runtime(paths: &ApplicationPaths, directory: &Path, version: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let node = paths.node_dir.join("bin/node");
+        fs::create_dir_all(node.parent().unwrap()).unwrap();
+        fs::write(
+            &node,
+            b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo v24.19.0; exit 0; fi\nscript=\"$1\"\nshift\nexec \"$script\" \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let package = directory.join("node_modules/@deepseek-ai/dsh");
+        let binary = package.join("lib/bin.js");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(
+            package.join("package.json"),
+            format!("{{\"version\":\"{version}\"}}\n"),
+        )
+        .unwrap();
+        fs::write(&binary, format!("#!/bin/sh\necho {version}\n")).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     #[test]
     fn node_assets_are_pinned_for_release_targets() {
         for (filename, _) in RELEASE_NODE_ASSETS {
@@ -3359,6 +3636,126 @@ mod tests {
         );
         rollback_directory(&active, previous.as_deref()).unwrap();
         assert_eq!(fs::read_to_string(active.join("value")).unwrap(), "old");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_harness_update_is_persisted_and_activated_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        write_fake_runtime(&paths, &paths.dsh_dir, "0.1.0");
+        fs::write(&paths.version_file, b"0.1.0\n").unwrap();
+        write_fake_runtime(&paths, &paths.pending_dsh_dir, "0.2.0");
+        atomic_write(
+            &paths.pending_harness_update_file,
+            br#"{"version":"0.2.0"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepared_harness_update(&paths).unwrap(),
+            Some("0.2.0".into())
+        );
+        let activated =
+            activate_prepared_harness_update(&paths, &DeploymentController::default(), |_| {})
+                .unwrap();
+
+        assert_eq!(activated, "0.2.0");
+        assert_eq!(installed_version(&paths).as_deref(), Some("0.2.0"));
+        assert!(!paths.pending_dsh_dir.exists());
+        assert!(!paths.pending_harness_update_file.exists());
+        assert_eq!(
+            dsh_manifest_version(&paths.runtime_dir.join("dsh.previous")).as_deref(),
+            Some("0.1.0")
+        );
+    }
+
+    #[test]
+    fn incomplete_prepared_harness_update_is_never_reported_as_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        atomic_write(
+            &paths.pending_harness_update_file,
+            br#"{"version":"0.2.0"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepared_harness_update(&paths).unwrap_err().code,
+            "preparedHarnessUpdateInvalid"
+        );
+        assert_eq!(recover_prepared_harness_update(&paths).unwrap(), None);
+        assert!(!paths.pending_harness_update_file.exists());
+    }
+
+    #[test]
+    fn orphaned_prepared_candidate_is_cleaned_during_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        fs::create_dir(&paths.pending_dsh_dir).unwrap();
+
+        assert_eq!(recover_prepared_harness_update(&paths).unwrap(), None);
+        assert!(!paths.pending_dsh_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_candidate_cleanup_never_follows_a_directory_link() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("user-data"), b"preserve").unwrap();
+        symlink(&outside, &paths.pending_dsh_dir).unwrap();
+
+        assert_eq!(recover_prepared_harness_update(&paths).unwrap(), None);
+        assert!(!paths.pending_dsh_dir.is_symlink());
+        assert_eq!(fs::read(outside.join("user-data")).unwrap(), b"preserve");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_candidate_never_downgrades_an_equal_or_newer_active_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ApplicationPaths::from_home(temp.path().join("desktop"));
+        paths.ensure_dirs().unwrap();
+        write_fake_runtime(&paths, &paths.dsh_dir, "0.2.0");
+        fs::write(&paths.version_file, b"0.2.0\n").unwrap();
+        write_fake_runtime(&paths, &paths.pending_dsh_dir, "0.1.0");
+        atomic_write(
+            &paths.pending_harness_update_file,
+            br#"{"version":"0.1.0"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(recover_prepared_harness_update(&paths).unwrap(), None);
+        assert!(!paths.pending_dsh_dir.exists());
+        assert!(!paths.pending_harness_update_file.exists());
+        assert_eq!(installed_version(&paths).as_deref(), Some("0.2.0"));
+    }
+
+    #[test]
+    fn failed_publication_preserves_active_and_previous_runtimes() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("dsh");
+        let previous = temp.path().join("dsh.previous");
+        fs::create_dir(&active).unwrap();
+        fs::create_dir(&previous).unwrap();
+        fs::write(active.join("value"), "active").unwrap();
+        fs::write(previous.join("value"), "previous").unwrap();
+
+        assert!(publish_directory(&temp.path().join("missing"), &active).is_err());
+        assert_eq!(fs::read_to_string(active.join("value")).unwrap(), "active");
+        assert_eq!(
+            fs::read_to_string(previous.join("value")).unwrap(),
+            "previous"
+        );
     }
 
     #[test]

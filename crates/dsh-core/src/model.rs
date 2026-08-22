@@ -161,12 +161,25 @@ pub enum HarnessUpdateState {
     Available {
         version: String,
     },
+    Downloading {
+        version: String,
+    },
+    Downloaded {
+        version: String,
+    },
     Installing {
         version: String,
     },
     Failed {
         version: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum HarnessUpdateMode {
+    Foreground,
+    Background,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

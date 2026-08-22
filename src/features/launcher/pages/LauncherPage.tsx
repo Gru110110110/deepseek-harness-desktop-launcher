@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   ChevronDown,
@@ -36,8 +36,18 @@ export function LauncherPage() {
   const busy = !running && !stopped && !failed;
   const serviceCopy = getServiceCopy(snapshot);
   const updateNotice = getHarnessUpdateNotice(snapshot);
+  const backgroundUpdating = snapshot.harnessUpdate.kind === "downloading";
+  const [updateChoiceVersion, setUpdateChoiceVersion] = useState<string | null>(
+    null,
+  );
+  const [downloadedPromptVersion, setDownloadedPromptVersion] = useState<
+    string | null
+  >(null);
+  const promptedDownload = useRef<string | null>(null);
+  const updateRequestPendingRef = useRef(false);
+  const [updateRequestPending, setUpdateRequestPending] = useState(false);
   const harnessUpdateBlocked =
-    !running ||
+    (!running && !stopped) ||
     snapshot.desktopUpdate.kind === "checking" ||
     snapshot.desktopUpdate.kind === "preparing" ||
     snapshot.desktopUpdate.kind === "downloading" ||
@@ -86,10 +96,49 @@ export function LauncherPage() {
     if (migrationWarning) showMigrationWarning(migrationWarning);
   }, [migrationWarning]);
 
+  useEffect(() => {
+    if (
+      snapshot.harnessUpdate.kind === "downloaded" &&
+      promptedDownload.current !== snapshot.harnessUpdate.version
+    ) {
+      promptedDownload.current = snapshot.harnessUpdate.version;
+      setDownloadedPromptVersion(snapshot.harnessUpdate.version);
+    } else if (snapshot.harnessUpdate.kind !== "downloaded") {
+      promptedDownload.current = null;
+      setDownloadedPromptVersion(null);
+    }
+  }, [snapshot.harnessUpdate]);
+
+  useEffect(() => {
+    if (!updateChoiceVersion) return;
+    const current = snapshot.harnessUpdate;
+    if (
+      !(
+        (current.kind === "available" || current.kind === "failed") &&
+        current.version === updateChoiceVersion
+      )
+    ) {
+      setUpdateChoiceVersion(null);
+    }
+  }, [snapshot.harnessUpdate, updateChoiceVersion]);
+
   const run = (task: Promise<unknown>) => {
     void task.catch((error: unknown) => {
       showTimedError(error, (key, values) => t(key, values));
     });
+  };
+  const runUpdateRequest = (task: () => Promise<unknown>) => {
+    if (updateRequestPendingRef.current) return;
+    updateRequestPendingRef.current = true;
+    setUpdateRequestPending(true);
+    void task()
+      .catch((error: unknown) => {
+        showTimedError(error, (key, values) => t(key, values));
+      })
+      .finally(() => {
+        updateRequestPendingRef.current = false;
+        setUpdateRequestPending(false);
+      });
   };
   const checkHarnessUpdate = () => {
     run(
@@ -140,17 +189,24 @@ export function LauncherPage() {
               disabled={
                 (!running && !stopped) ||
                 !snapshot.harnessVersion ||
-                snapshot.harnessUpdate.kind === "checking"
+                snapshot.harnessUpdate.kind === "checking" ||
+                snapshot.harnessUpdate.kind === "downloading" ||
+                snapshot.harnessUpdate.kind === "installing"
               }
               onClick={checkHarnessUpdate}
             >
               <RefreshCw
                 size={13}
                 className={
-                  snapshot.harnessUpdate.kind === "checking" ? "spin" : ""
+                  snapshot.harnessUpdate.kind === "checking" ||
+                  backgroundUpdating
+                    ? "spin"
+                    : ""
                 }
               />
-              {t("action.checkUpdate")}
+              {backgroundUpdating
+                ? t("action.backgroundUpdating")
+                : t("action.checkUpdate")}
             </button>
           </div>
         </div>
@@ -212,13 +268,135 @@ export function LauncherPage() {
             {t(updateNotice.message.key, updateNotice.message.values)}
           </span>
           <button
-            disabled={harnessUpdateBlocked}
+            disabled={harnessUpdateBlocked || updateRequestPending}
             onClick={() => {
-              run(launcherApi.updateHarness());
+              if (snapshot.harnessUpdate.kind === "downloaded") {
+                setDownloadedPromptVersion(snapshot.harnessUpdate.version);
+              } else if (
+                snapshot.harnessUpdate.kind === "available" ||
+                snapshot.harnessUpdate.kind === "failed"
+              ) {
+                setUpdateChoiceVersion(snapshot.harnessUpdate.version);
+              }
             }}
           >
             {t(updateNotice.actionLabel)}
           </button>
+        </div>
+      )}
+
+      {updateChoiceVersion && (
+        <div
+          className="modal-overlay"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.currentTarget === event.target) {
+              setUpdateChoiceVersion(null);
+            }
+          }}
+        >
+          <div
+            className="update-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="harness-update-mode-title"
+          >
+            <h2 id="harness-update-mode-title">
+              {t("update.harness.modeTitle", { version: updateChoiceVersion })}
+            </h2>
+            <p>{t("update.harness.modeDetail")}</p>
+            <div className="update-mode-options">
+              <button
+                className="update-mode-option"
+                type="button"
+                disabled={updateRequestPending}
+                onClick={() => {
+                  const version = updateChoiceVersion;
+                  setUpdateChoiceVersion(null);
+                  runUpdateRequest(() =>
+                    launcherApi.updateHarness("background", version),
+                  );
+                }}
+              >
+                <strong>{t("update.harness.backgroundTitle")}</strong>
+                <span>{t("update.harness.backgroundDetail")}</span>
+              </button>
+              <button
+                className="update-mode-option"
+                type="button"
+                disabled={updateRequestPending}
+                onClick={() => {
+                  const version = updateChoiceVersion;
+                  setUpdateChoiceVersion(null);
+                  runUpdateRequest(() =>
+                    launcherApi.updateHarness("foreground", version),
+                  );
+                }}
+              >
+                <strong>{t("update.harness.foregroundTitle")}</strong>
+                <span>{t("update.harness.foregroundDetail")}</span>
+              </button>
+            </div>
+            <div className="modal-actions">
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={updateRequestPending}
+                onClick={() => {
+                  setUpdateChoiceVersion(null);
+                }}
+              >
+                {t("action.cancel")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {downloadedPromptVersion && (
+        <div className="modal-overlay" role="presentation">
+          <div
+            className="update-modal"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="harness-update-ready-title"
+            aria-describedby="harness-update-ready-detail"
+          >
+            <h2 id="harness-update-ready-title">
+              {t("update.harness.downloadCompleteTitle")}
+            </h2>
+            <p id="harness-update-ready-detail">
+              {t("update.harness.downloadCompleteDetail", {
+                version: downloadedPromptVersion,
+              })}
+            </p>
+            <div className="modal-actions">
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={updateRequestPending}
+                onClick={() => {
+                  setDownloadedPromptVersion(null);
+                }}
+              >
+                {t("action.later")}
+              </button>
+              <button
+                className="primary-button"
+                type="button"
+                disabled={updateRequestPending}
+                onClick={() => {
+                  const version = downloadedPromptVersion;
+                  setDownloadedPromptVersion(null);
+                  runUpdateRequest(() =>
+                    launcherApi.activateHarnessUpdate(version),
+                  );
+                }}
+              >
+                {t("action.confirmRestartAndUpdate")}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

@@ -63,8 +63,12 @@ export type HarnessUpdateState =
   | { kind: "none" }
   | { kind: "checking" }
   | { kind: "available"; version: string }
+  | { kind: "downloading"; version: string }
+  | { kind: "downloaded"; version: string }
   | { kind: "installing"; version: string }
   | { kind: "failed"; version: string };
+
+export type HarnessUpdateMode = "foreground" | "background";
 
 export type MigrationPlan = {
   sourceEntries: number;
